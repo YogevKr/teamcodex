@@ -1,0 +1,27 @@
+{
+  "listen": "127.0.0.1:4269",
+  "client_token_env": "TEAMCODEX_PROXY_TOKEN",
+  "threshold_percent": 95,
+  "probe_interval_seconds": 60,
+  "idle_timeout_seconds": 300,
+  "model_limits": {},
+  "accounts": [
+    {
+      "name": "personal",
+      "kind": "chatgpt",
+      "credential": {
+        "type": "command",
+        "argv": ["opagent", "python3", "/absolute/path/to/opgate-credential.py", "CODEX_PERSONAL"],
+        "cache_seconds": 240
+      },
+      "priority": 0
+    },
+    {
+      "name": "api-fallback",
+      "kind": "api",
+      "credential": {"type": "env", "name": "OPENAI_API_KEY"},
+      "priority": 10,
+      "disabled": true
+    }
+  ]
+}

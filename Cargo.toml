@@ -1,0 +1,33 @@
+[package]
+name = "teamcodex"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "A local account pool and streaming proxy for Codex"
+license = "MIT"
+publish = false
+
+[[bin]]
+name = "tcx"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+async-stream = "0.3"
+axum = "0.8"
+bytes = "1"
+clap = { version = "4", features = ["derive"] }
+futures-util = "0.3"
+httpdate = "1"
+ratatui = "0.30"
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal", "sync", "time", "process", "io-util"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+lto = "thin"
+strip = true
