@@ -19,6 +19,7 @@ It does not copy source from teamclaude-rs or change that project.
 - ChatGPT account tokens and OpenAI API keys through external credential sources.
 - A credential command with bounded output, timeout, cache, and concurrent refresh control.
 - Priority tiers, reserved groups, model restrictions, and session affinity.
+- Automatic account selection after an explicit model access rejection.
 - Primary, secondary, and configured model quota windows.
 - Usage polling and quota updates from response headers and stream events.
 - Account changes after explicit rate limits, rejected credentials, or connection failures.
@@ -148,7 +149,7 @@ Each account has a `name`, `kind`, and `credential`.
 | `priority` | Lower values select first. Default: `0`. |
 | `disabled` | Initial account state. Default: `false`. |
 | `groups` | Reserved groups. Empty accounts serve requests without a group. |
-| `models` | Exact allowed model names. Empty allows all models. |
+| `models` | Exact allowed model names. Empty allows any model not temporarily restricted by an upstream rejection. |
 
 ChatGPT accounts without an endpoint override poll `/backend-api/wham/usage`.
 API accounts use response headers; they do not call the ChatGPT usage endpoint.
@@ -156,6 +157,19 @@ API request and token limits apply to the model that produced those headers.
 The proxy does not infer shared API model-family limits from these headers.
 Custom endpoints require HTTPS. HTTP is allowed only for numeric loopback addresses during local tests.
 The proxy does not follow upstream redirects.
+
+Model access can differ between accounts. Set each account's `models` list when you know its available models.
+An empty list means availability is unknown until the upstream responds.
+On an explicit model access rejection, the proxy tries another eligible account with the same model and request body.
+It remembers the rejected account and model for five minutes. Other models can still use that account.
+After five minutes, the account becomes eligible for another attempt with that model.
+The status field `unavailable_models` maps each rejected model to its retry time, in Unix seconds.
+Each account stores at most 256 rejected models. This cache resets when the server restarts.
+
+The proxy recognizes `model_not_found`, `model_access_denied`, and the explicit ChatGPT account model rejection message.
+Generic permission, parameter, endpoint, and safety errors pass through without account changes.
+If every matching account excludes the model, the proxy returns HTTP 404 with code `model_unavailable`.
+Quota exhaustion still returns HTTP 429. The proxy does not substitute a different model.
 
 Configure model buckets explicitly. The proxy does not guess model names from bucket labels.
 It always applies the default Codex bucket and adds the configured buckets.
@@ -231,15 +245,18 @@ Browser requests with an `Origin` header receive 403.
 - A 401 response triggers one credential refresh and one retry on that account.
 - A second 401 puts that account on hold and selects another eligible account.
 - A 429 response records `Retry-After` and selects another eligible account.
+- An explicit model rejection with HTTP 400, 403, or 404 restricts that account and model, then selects another account.
 - A connection failure can select another account before the request reaches the upstream.
 - A timeout after connection has an unknown outcome. The proxy returns 502 without replay.
 - Other upstream errors pass through once.
 - Stream errors never trigger request replay after streaming starts.
 - A stream rate-limit error puts the account on hold for later requests.
+- A streamed model rejection restricts that account and model for later requests. The current stream is not replayed.
 
 `previous_response_id` pins a request to the account that produced that response.
 An unavailable pinned account returns 429.
 An unknown response ID returns 409 and requires full conversation history.
+A model rejection on a pinned account returns 404. Choose another model or resend full history without `previous_response_id`.
 Response and session records expire after 24 hours. Each record map holds at most 10,000 entries.
 
 Usage, holds, affinity, and account controls remain in memory.
@@ -255,6 +272,7 @@ cargo test --locked
 cargo build --locked
 python3 -B -m unittest discover -s scripts -p 'test_*.py'
 python3 scripts/e2e.py
+python3 scripts/e2e.py --model-unavailable
 python3 scripts/tui_e2e.py
 ```
 
@@ -263,6 +281,7 @@ It runs the installed Codex CLI through `tcx run`.
 The first account returns 429. The second account requests a file write in a temporary workspace.
 Codex executes the command and returns its result through the proxy.
 The test checks the final response, account change, token totals, and account controls.
+The `--model-unavailable` case replaces the first account's rate limit with a model rejection and repeats the tool cycle.
 Local tests use Codex's `workspace-write` sandbox by default.
 The disposable Linux CI runner blocks sandbox user namespaces, so that job passes `--sandbox danger-full-access`.
 Its local mock supplies only the fixed marker command. This option does not change `tcx` defaults.

@@ -13,6 +13,8 @@ use std::{
 
 const AFFINITY_LIMIT: usize = 10000;
 const AFFINITY_TTL: u64 = 24 * 3600;
+const MODEL_RETRY_SECONDS: u64 = 300;
+const MODEL_CACHE_LIMIT: usize = 256;
 
 #[derive(Default, Clone, Serialize)]
 pub struct AccountState {
@@ -29,6 +31,7 @@ pub struct AccountState {
     pub estimated_cost_usd: f64,
     pub unpriced_requests: u64,
     pub quotas: Quotas,
+    pub unavailable_models: HashMap<String, u64>,
     pub last_error: Option<String>,
     pub last_probe: Option<u64>,
     pub last_probe_ok: Option<bool>,
@@ -103,6 +106,7 @@ impl Pool {
         let mut accounts = state.accounts.clone();
         let at = now();
         for account in &mut accounts {
+            account.unavailable_models.retain(|_, until| *until > at);
             for window in account.quotas.values_mut() {
                 window.used_percent = window.used(at);
             }
@@ -170,6 +174,10 @@ impl Pool {
                 let eligible = !account.disabled
                     && account.hold_until <= timestamp
                     && !limited
+                    && account
+                        .unavailable_models
+                        .get(model)
+                        .is_none_or(|until| *until <= timestamp)
                     && !tried.contains(&idx)
                     && pinned.is_none_or(|pin| pin == idx)
                     && (model.is_empty()
@@ -224,6 +232,61 @@ impl Pool {
         self.state.lock().unwrap().accounts[idx]
             .quotas
             .extend(quotas);
+    }
+
+    pub fn mark_model_unavailable(&self, idx: usize, model: &str) {
+        if model.is_empty() || model.len() > 256 {
+            return;
+        }
+        let mut state = self.state.lock().unwrap();
+        let models = &mut state.accounts[idx].unavailable_models;
+        let at = now();
+        models.retain(|_, until| *until > at);
+        if models.len() >= MODEL_CACHE_LIMIT
+            && !models.contains_key(model)
+            && let Some(oldest) = models
+                .iter()
+                .min_by_key(|(_, until)| *until)
+                .map(|(name, _)| name.clone())
+        {
+            models.remove(&oldest);
+        }
+        models.insert(model.to_owned(), at + MODEL_RETRY_SECONDS);
+    }
+
+    /// Ignore quota and account holds: distinguish model access from capacity.
+    pub fn model_unavailable(
+        &self,
+        model: &str,
+        group: Option<&str>,
+        pinned: Option<usize>,
+    ) -> bool {
+        if model.is_empty() {
+            return false;
+        }
+        let state = self.state.lock().unwrap();
+        let at = now();
+        let mut matched = false;
+        for (idx, account) in self.config.accounts.iter().enumerate() {
+            if pinned.is_some_and(|pin| pin != idx)
+                || !match group {
+                    Some(g) => account.groups.iter().any(|name| name == g),
+                    None => account.groups.is_empty(),
+                }
+            {
+                continue;
+            }
+            matched = true;
+            if (account.models.is_empty() || account.models.iter().any(|name| name == model))
+                && state.accounts[idx]
+                    .unavailable_models
+                    .get(model)
+                    .is_none_or(|until| *until <= at)
+            {
+                return false;
+            }
+        }
+        matched
     }
 
     pub fn hold(&self, idx: usize, until: u64, reason: &str) {
@@ -326,12 +389,14 @@ impl Pool {
             .accounts
             .iter()
             .flat_map(|a| {
-                std::iter::once(a.hold_until).chain(
-                    a.quotas
-                        .values()
-                        .filter(|w| w.used(timestamp) >= self.config.threshold_percent)
-                        .filter_map(|w| w.reset_at),
-                )
+                std::iter::once(a.hold_until)
+                    .chain(a.unavailable_models.values().copied())
+                    .chain(
+                        a.quotas
+                            .values()
+                            .filter(|w| w.used(timestamp) >= self.config.threshold_percent)
+                            .filter_map(|w| w.reset_at),
+                    )
             })
             .filter(|at| *at > timestamp)
             .min()

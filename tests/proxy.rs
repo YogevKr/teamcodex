@@ -692,3 +692,265 @@ async fn stream_rate_limit_holds_account_for_future_requests_without_replay() {
     assert_eq!(calls.len(), 2);
     assert_eq!(calls[1].0["authorization"], "Bearer test-upstream-b");
 }
+
+#[tokio::test]
+async fn model_rejection_rotates_and_caches_only_the_account_model_pair() {
+    for (status, rejection) in [
+        (
+            StatusCode::NOT_FOUND,
+            json!({"error":{"code":"model_not_found"}}),
+        ),
+        (
+            StatusCode::FORBIDDEN,
+            json!({"error":{"code":"model_access_denied"}}),
+        ),
+        (
+            StatusCode::BAD_REQUEST,
+            json!({"detail":"The 'spark' model is not supported when using Codex with a ChatGPT account."}),
+        ),
+    ] {
+        let mock = mock(move |token, _, body| {
+            let value: Value = serde_json::from_slice(body).unwrap();
+            if token.ends_with("-a") && value["model"] == "spark" {
+                (status, Json(rejection.clone())).into_response()
+            } else {
+                Json(completed("resp_model")).into_response()
+            }
+        });
+        let source = upstream(&mock).await;
+        let mut cfg = config(&source.url);
+        cfg.accounts[1].priority = 10;
+        let (pool, server) = gateway(cfg).await;
+        let body = r#"{ "model": "spark", "input": "keep the original request" }"#;
+        for _ in 0..2 {
+            assert_eq!(
+                post(&server)
+                    .header("session_id", "model-session")
+                    .header("content-type", "application/json")
+                    .body(body)
+                    .send()
+                    .await
+                    .unwrap()
+                    .status(),
+                200
+            );
+        }
+        assert_eq!(
+            post(&server)
+                .json(&json!({"model":"other"}))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            200
+        );
+        let calls = mock.calls.lock().unwrap();
+        assert_eq!(calls.len(), 4);
+        assert_eq!(
+            calls[0].1, calls[1].1,
+            "Account rotation must retain the model and body"
+        );
+        assert_eq!(calls[2].0["authorization"], "Bearer test-upstream-b");
+        assert_eq!(calls[3].0["authorization"], "Bearer test-upstream-a");
+        let snapshot = pool.snapshot();
+        assert!(snapshot.accounts[0].unavailable_models["spark"] > now());
+        assert_eq!(snapshot.accounts[0].hold_until, 0);
+        assert!(snapshot.accounts[1].unavailable_models.is_empty());
+    }
+}
+
+#[tokio::test]
+async fn all_accounts_reject_model_then_recover_after_cache_expiry() {
+    let reject = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let reject_upstream = reject.clone();
+    let mock = mock(move |_, _, _| {
+        if reject_upstream.load(std::sync::atomic::Ordering::SeqCst) {
+            (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error":{"code":"model_not_found"}})),
+            )
+                .into_response()
+        } else {
+            Json(completed("resp_restored")).into_response()
+        }
+    });
+    let source = upstream(&mock).await;
+    let (pool, server) = gateway(config(&source.url)).await;
+    for _ in 0..2 {
+        let response = post(&server)
+            .json(&json!({"model":"spark"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 404);
+        assert_eq!(
+            response.json::<Value>().await.unwrap()["error"]["code"],
+            "model_unavailable"
+        );
+    }
+    assert_eq!(
+        mock.calls.lock().unwrap().len(),
+        2,
+        "Cached rejections must not reach the upstream"
+    );
+    reject.store(false, std::sync::atomic::Ordering::SeqCst);
+    for account in &mut pool.state.lock().unwrap().accounts {
+        account.unavailable_models.insert("spark".into(), now() - 1);
+    }
+    assert_eq!(
+        post(&server)
+            .json(&json!({"model":"spark"}))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
+    assert!(
+        pool.snapshot()
+            .accounts
+            .iter()
+            .all(|account| account.unavailable_models.is_empty())
+    );
+}
+
+#[tokio::test]
+async fn unrelated_rejections_are_not_replayed_or_cached_as_model_failures() {
+    for (status, code) in [
+        (StatusCode::BAD_REQUEST, "unsupported_parameter"),
+        (StatusCode::FORBIDDEN, "permission_denied"),
+        (StatusCode::FORBIDDEN, "content_policy_violation"),
+        (StatusCode::NOT_FOUND, "endpoint_not_found"),
+        (StatusCode::INTERNAL_SERVER_ERROR, "model_not_found"),
+    ] {
+        let body = format!("{{\"error\":{{\"code\":\"{code}\"}}}}");
+        let expected = body.clone();
+        let mock = mock(move |_, _, _| {
+            (status, [("content-type", "application/json")], body.clone()).into_response()
+        });
+        let source = upstream(&mock).await;
+        let (pool, server) = gateway(config(&source.url)).await;
+        let response = post(&server)
+            .json(&json!({"model":"spark"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), status);
+        assert_eq!(response.text().await.unwrap(), expected);
+        assert_eq!(mock.calls.lock().unwrap().len(), 1);
+        assert!(
+            pool.snapshot()
+                .accounts
+                .iter()
+                .all(|account| account.unavailable_models.is_empty())
+        );
+    }
+}
+
+#[tokio::test]
+async fn model_rejection_keeps_previous_response_on_its_account() {
+    let mock = mock(|token, _, _| {
+        if token.ends_with("-a") {
+            (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error":{"code":"model_not_found"}})),
+            )
+                .into_response()
+        } else {
+            Json(completed("resp_other")).into_response()
+        }
+    });
+    let source = upstream(&mock).await;
+    let (pool, server) = gateway(config(&source.url)).await;
+    pool.record(0, 200, "complete", Some(&completed("resp_pinned")));
+    for _ in 0..2 {
+        assert_eq!(
+            post(&server)
+                .json(&json!({"model":"spark","previous_response_id":"resp_pinned"}))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            404
+        );
+    }
+    assert_eq!(mock.calls.lock().unwrap().len(), 1);
+    assert_eq!(
+        post(&server)
+            .json(&json!({"model":"spark","input":"full history"}))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
+    assert_eq!(
+        mock.calls.lock().unwrap()[1].0["authorization"],
+        "Bearer test-upstream-b"
+    );
+}
+
+#[tokio::test]
+async fn streamed_model_rejection_affects_future_requests_without_replay() {
+    let failed = format!(
+        "data: {}\n\ndata: {}\n\n",
+        json!({"type":"response.output_text.delta","delta":"partial output"}),
+        json!({"type":"response.failed","response":{"error":{"code":"model_not_found"}}})
+    );
+    let expected = failed.clone();
+    let mock = mock(move |token, _, _| {
+        if token.ends_with("-a") {
+            ([("content-type", "text/event-stream")], failed.clone()).into_response()
+        } else {
+            sse_response()
+        }
+    });
+    let source = upstream(&mock).await;
+    let (pool, server) = gateway(config(&source.url)).await;
+    let response = post(&server)
+        .json(&json!({"model":"spark","stream":true}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.text().await.unwrap(), expected);
+    assert_eq!(mock.calls.lock().unwrap().len(), 1);
+    let snapshot = pool.snapshot();
+    assert_eq!(snapshot.accounts[0].hold_until, 0);
+    assert!(snapshot.accounts[0].unavailable_models["spark"] > now());
+    assert_eq!(snapshot.recent[0].outcome, "stream_model_unavailable");
+    assert_eq!(snapshot.accounts[0].errors, 1);
+    post(&server)
+        .json(&json!({"model":"spark","stream":true}))
+        .send()
+        .await
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+    assert_eq!(
+        mock.calls.lock().unwrap()[1].0["authorization"],
+        "Bearer test-upstream-b"
+    );
+}
+
+#[test]
+fn model_cache_is_bounded_and_model_checks_respect_groups_and_configuration() {
+    let mut cfg = config("http://127.0.0.1:1");
+    cfg.accounts[0].models = vec!["base".into()];
+    cfg.accounts[1].groups = vec!["reserved".into()];
+    let pool = Pool::new(cfg).unwrap();
+    assert!(pool.model_unavailable("spark", None, None));
+    assert!(!pool.model_unavailable("spark", Some("reserved"), None));
+    assert!(!pool.model_unavailable("base", None, None));
+    pool.mark_model_unavailable(0, "base");
+    assert!(pool.select("base", None, None, None, &[]).is_none());
+    assert!(pool.model_unavailable("base", None, None));
+    pool.state.lock().unwrap().accounts[0]
+        .unavailable_models
+        .insert("base".into(), now() - 1);
+    assert!(pool.select("base", None, None, None, &[]).is_some());
+    for index in 0..500 {
+        pool.mark_model_unavailable(0, &format!("model-{index}"));
+    }
+    assert_eq!(pool.snapshot().accounts[0].unavailable_models.len(), 256);
+}

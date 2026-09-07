@@ -1,6 +1,6 @@
 use crate::{
     auth::Token,
-    now,
+    models, now,
     pool::{Lease, Pool},
     quota,
     sse::Parser,
@@ -258,6 +258,46 @@ async fn handle(State(app): State<App>, request: Request) -> Response {
             app.pool.hold(idx, now() + 30, "authentication_failed");
             continue;
         }
+        if !model.is_empty()
+            && matches!(
+                status,
+                StatusCode::BAD_REQUEST | StatusCode::FORBIDDEN | StatusCode::NOT_FOUND
+            )
+            && !is_event_stream(upstream.headers())
+        {
+            let headers = response_headers(upstream.headers());
+            let body = match read_bounded(upstream, MAX_BODY, app.pool.config.idle_timeout_seconds)
+                .await
+            {
+                Ok(body) => body,
+                Err(_) => {
+                    app.pool.record(idx, 502, "response_read_failed", None);
+                    return error(
+                        StatusCode::BAD_GATEWAY,
+                        "response_read_failed",
+                        "Upstream response exceeded limits or ended early",
+                    );
+                }
+            };
+            let value = serde_json::from_slice::<Value>(&body).ok();
+            if value
+                .as_ref()
+                .is_some_and(|value| models::unavailable(value, model))
+            {
+                app.pool.mark_model_unavailable(idx, model);
+                app.pool
+                    .record_model(idx, status.as_u16(), "model_unavailable", None, model);
+                continue;
+            }
+            app.pool.record_model(
+                idx,
+                status.as_u16(),
+                "upstream_rejected",
+                value.as_ref(),
+                model,
+            );
+            return buffered_response(status, headers, body);
+        }
         return forward(
             upstream,
             lease,
@@ -266,7 +306,13 @@ async fn handle(State(app): State<App>, request: Request) -> Response {
         )
         .await;
     }
-    let mut response = if auth_failure {
+    let mut response = if app.pool.model_unavailable(model, group, pinned) {
+        error(
+            StatusCode::NOT_FOUND,
+            "model_unavailable",
+            "No account eligible for this request supports the requested model",
+        )
+    } else if auth_failure {
         error(
             StatusCode::SERVICE_UNAVAILABLE,
             "credentials_unavailable",
@@ -376,6 +422,20 @@ fn response_headers(source: &HeaderMap) -> HeaderMap {
     output
 }
 
+fn is_event_stream(headers: &HeaderMap) -> bool {
+    headers
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.starts_with("text/event-stream"))
+}
+
+fn buffered_response(status: StatusCode, headers: HeaderMap, bytes: Vec<u8>) -> Response {
+    let mut response = Response::new(Body::from(bytes));
+    *response.status_mut() = status;
+    *response.headers_mut() = headers;
+    response
+}
+
 struct Observation {
     lease: Lease,
     status: u16,
@@ -405,11 +465,7 @@ impl Drop for Observation {
 async fn forward(upstream: reqwest::Response, lease: Lease, idle: u64, model: String) -> Response {
     let status = upstream.status();
     let headers = response_headers(upstream.headers());
-    let stream = upstream
-        .headers()
-        .get("content-type")
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(|v| v.starts_with("text/event-stream"));
+    let stream = is_event_stream(upstream.headers());
     let mut observation = Observation {
         lease,
         status: status.as_u16(),
@@ -428,7 +484,10 @@ async fn forward(upstream: reqwest::Response, lease: Lease, idle: u64, model: St
                             match event.get("type").and_then(Value::as_str) {
                                 Some("response.completed") => observation.finish("complete", event.get("response")),
                                 Some("response.failed" | "response.incomplete" | "error") => {
-                                    if let Some(until) = quota::stream_hold(&event, now()) {
+                                    if models::unavailable(&event, &observation.model) {
+                                        observation.lease.pool.mark_model_unavailable(observation.lease.idx, &observation.model);
+                                        observation.finish("stream_model_unavailable", event.get("response"));
+                                    } else if let Some(until) = quota::stream_hold(&event, now()) {
                                         observation.lease.pool.defer(observation.lease.idx, until);
                                         observation.finish("stream_rate_limited", event.get("response"));
                                     } else {
@@ -479,10 +538,7 @@ async fn forward(upstream: reqwest::Response, lease: Lease, idle: u64, model: St
             },
             value.as_ref(),
         );
-        let mut response = Response::new(Body::from(bytes));
-        *response.status_mut() = status;
-        *response.headers_mut() = headers;
-        response
+        buffered_response(status, headers, bytes)
     }
 }
 

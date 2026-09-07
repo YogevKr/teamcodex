@@ -47,6 +47,8 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--binary", default=str(ROOT / "target/debug/tcx"))
     parser.add_argument("--skip-codex", action="store_true")
+    parser.add_argument("--model-unavailable", action="store_true",
+        help="First account rejects the model instead of returning a rate limit")
     parser.add_argument("--sandbox", choices=("workspace-write", "danger-full-access"), default="workspace-write",
         help="Codex tool sandbox; CI runners without user namespaces require danger-full-access")
     args = parser.parse_args()
@@ -81,10 +83,14 @@ def main():
                     observed.append({"token": token, "body": payload, "path": self.path})
                     number = len(observed)
                 if token == "Bearer test-upstream-a":
-                    self.send_response(429)
-                    self.send_header("Retry-After", "300")
-                    self.send_header("Content-Length", "0")
+                    failure = json.dumps({"error": {"code": "model_not_found"}}).encode() if args.model_unavailable else b""
+                    self.send_response(404 if args.model_unavailable else 429)
+                    self.send_header("Content-Type", "application/json")
+                    if not args.model_unavailable:
+                        self.send_header("Retry-After", "300")
+                    self.send_header("Content-Length", str(len(failure)))
                     self.end_headers()
+                    self.wfile.write(failure)
                     return
                 assert token == "Bearer test-upstream-b", token
                 response_id = "resp_e2e_" + str(number)
@@ -186,7 +192,11 @@ def main():
             assert observed[0]["body"] == observed[1]["body"], "Failover changed the request body"
             status_result = subprocess.run(command + ["status"], env=env, capture_output=True, text=True, check=True)
             status = json.loads(status_result.stdout)
-            assert status["accounts"][0]["hold_until"] > time.time()
+            if args.model_unavailable:
+                assert status["accounts"][0]["unavailable_models"][observed[0]["body"]["model"]] > time.time()
+                assert status["accounts"][0]["hold_until"] == 0
+            else:
+                assert status["accounts"][0]["hold_until"] > time.time()
             assert status["accounts"][1]["input_tokens"] >= 20
             assert status["accounts"][1]["in_flight"] == 0
             assert "test-upstream" not in status_result.stdout
@@ -196,6 +206,7 @@ def main():
             assert not request(url, "/status")["accounts"][1]["disabled"]
             print(json.dumps({"result": "PASS", "codex_tool_cycle": not args.skip_codex,
                 "upstream_requests": len(observed), "failover": True, "status": True,
+                "failover_reason": "model_unavailable" if args.model_unavailable else "rate_limit",
                 "account_controls": True, "input_tokens": status["accounts"][1]["input_tokens"]}, indent=2))
         finally:
             if process.poll() is None:
