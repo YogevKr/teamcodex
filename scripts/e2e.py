@@ -171,7 +171,9 @@ def main():
                     env=env, cwd=workspace, capture_output=True, text=True, timeout=90)
                 if result.returncode or "TEAMCODEX_E2E_OK" not in result.stdout:
                     raise AssertionError("Codex tool cycle failed:\n" + result.stdout[-6000:] + "\n" + result.stderr[-6000:])
-                assert marker.read_text() == "TEAMCODEX_TOOL_OK", "Codex did not execute the tool"
+                if not marker.is_file() or marker.read_text() != "TEAMCODEX_TOOL_OK":
+                    raise AssertionError("Codex did not create the test marker:\n"
+                        + result.stdout[-6000:] + "\n" + result.stderr[-6000:])
                 assert len(observed) >= 3, observed
                 assert any(any(item.get("type") == "function_call_output" for item in call["body"].get("input", [])
                     if isinstance(item, dict)) for call in observed), "No tool output returned through proxy"
