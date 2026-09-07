@@ -164,6 +164,9 @@ def main():
             else:
                 result = subprocess.run(command + ["run", "--", "exec", "--ignore-user-config", "--ignore-rules",
                     "--ephemeral", "--skip-git-repo-check", "--sandbox", "workspace-write", "--json",
+                    # Hosted Linux runners cannot configure bubblewrap's loopback
+                    # namespace. Keep filesystem isolation and use the host network.
+                    "-c", "sandbox_workspace_write.network_access=true",
                     "-c", 'cli_auth_credentials_store="ephemeral"',
                     "-c", 'model="gpt-5.3-codex"',
                     "-c", 'model_reasoning_effort="low"',
