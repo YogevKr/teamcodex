@@ -237,7 +237,8 @@ These prices are examples, not current OpenAI prices.
 Price estimates describe API-equivalent token cost. They do not represent subscription charges.
 `unpriced_requests` reports calls without usable pricing or usage data.
 
-Within a priority tier, session affinity selects first.
+An established session stays on its eligible account, even when a higher-priority account recovers.
+Priority tiers select new sessions. Affinity is separate for each model and group.
 Other requests prefer fewer active requests, then the earliest known reset, then the least recent selection.
 A quota window becomes available when its recorded reset time passes.
 Unknown quota remains unknown until the server reports it.
@@ -303,9 +304,22 @@ An unknown response ID returns 409 and requires full conversation history.
 A model rejection on a pinned account returns 404. Choose another model or resend full history without `previous_response_id`.
 Response and session records expire after 24 hours. Each record map holds at most 10,000 entries.
 
-Usage, holds, affinity, and account controls remain in memory.
-They reset when the server restarts. Status totals cover the current server process.
-The proxy stores no prompts, response bodies, credentials, or usage ledger on disk.
+The server saves session and response routing in `<config>.state/routing.jsonl` before using new bindings.
+The journal uses private files, a single-writer lock, durable appends, and bounded compaction.
+It stores hashes of routing keys and account bindings. It stores no prompts, response text, or credentials.
+Bindings survive restarts and account reordering. Changed account identities or credential sources invalidate old bindings.
+Unchanged bindings refresh at most once per minute. An incomplete final journal record is discarded after a crash.
+A malformed complete record stops startup. A write failure blocks later requests instead of silently discarding affinity.
+`tcx status` reports `routing_persistent` and `routing_healthy`.
+
+The proxy forwards prompt bytes, `prompt_cache_key`, cache options, session headers, and turn-state headers unchanged.
+It accepts Codex `session-id` and `thread-id` headers and legacy underscore spellings.
+Diagnostic `x-client-request-id` values never override a cache key or create affinity.
+Account fallback can require a new upstream cache. OpenAI controls cache placement, retention, and eviction.
+See [OpenAI prompt caching](https://developers.openai.com/api/docs/guides/prompt-caching).
+
+Usage, holds, and account controls remain in memory and reset on restart. Status totals cover the current server process.
+Upgrading from 0.2.0 cannot recover its in-memory bindings. Restart between active Codex sessions to avoid losing them.
 
 ## Verification
 
@@ -344,6 +358,16 @@ OAuth tests use a local authorization server to verify PKCE, callback validation
 Refresh tests verify token rotation, concurrent callers, expiry, temporary failures, and rejected credentials.
 The CLI tests check direct launch, proxy authentication, YOLO argument order, and account-list redaction.
 Local tests use synthetic credentials. They do not prove live ChatGPT or OpenAI account access.
+An opt-in live test uses synthetic prompts through an isolated proxy and your configured native accounts:
+
+```sh
+python3 scripts/live_cache_e2e.py --live --config ~/.config/teamcodex/config.json --list-models
+python3 scripts/live_cache_e2e.py --live --config ~/.config/teamcodex/config.json --model MODEL --output artifacts/live-cache.json
+```
+
+Select a model your account lists. The test uses real account quota.
+It checks reported cached tokens, then repeats after restarting the test proxy and reversing the account order.
+It leaves the existing proxy and sessions running. It reads configuration references; TeamCodex loads credentials.
 Live verification requires completing `tcx login` or supplying an external credential source.
 
 ## Scope

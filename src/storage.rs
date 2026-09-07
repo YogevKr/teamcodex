@@ -56,6 +56,14 @@ fn check_file(file: &File) -> Result<()> {
     Ok(())
 }
 
+pub fn open_private_append(path: &Path) -> Result<File> {
+    create_parent(path)?;
+    let file = options().read(true).append(true).create(true).open(path)?;
+    check_file(&file)?;
+    File::open(path.parent().context("file needs a parent directory")?)?.sync_all()?;
+    Ok(file)
+}
+
 pub fn read_private(path: &Path) -> Result<Vec<u8>> {
     let file = options()
         .read(true)

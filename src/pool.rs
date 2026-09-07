@@ -1,4 +1,5 @@
 use crate::{
+    affinity::{self, Kind as RouteKind, Routing},
     auth::Auth,
     config::Config,
     now,
@@ -11,8 +12,6 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-const AFFINITY_LIMIT: usize = 10000;
-const AFFINITY_TTL: u64 = 24 * 3600;
 const MODEL_RETRY_SECONDS: u64 = 300;
 const MODEL_CACHE_LIMIT: usize = 256;
 
@@ -52,12 +51,13 @@ pub struct Snapshot {
     pub accounts: Vec<AccountState>,
     pub recent: Vec<RequestLog>,
     pub at: u64,
+    pub routing_persistent: bool,
+    pub routing_healthy: bool,
 }
 
 pub struct State {
     pub accounts: Vec<AccountState>,
-    affinity: HashMap<String, (usize, u64)>,
-    responses: HashMap<String, (usize, u64)>,
+    routing: Routing,
     sequence: u64,
     recent: VecDeque<RequestLog>,
 }
@@ -67,11 +67,35 @@ pub struct Pool {
     pub auth: Vec<Auth>,
     pub state: Mutex<State>,
     pub client: reqwest::Client,
+    bindings: Vec<String>,
 }
 
 impl Pool {
     pub fn new(config: Config) -> anyhow::Result<Arc<Self>> {
+        Self::with_routing(config, Routing::default())
+    }
+
+    pub fn persistent(config: Config, path: &std::path::Path) -> anyhow::Result<Arc<Self>> {
+        Self::with_routing(config, Routing::open(path)?)
+    }
+
+    fn with_routing(config: Config, routing: Routing) -> anyhow::Result<Arc<Self>> {
         config.validate()?;
+        let bindings = config
+            .accounts
+            .iter()
+            .map(|a| {
+                serde_json::to_vec(&(
+                    &a.name,
+                    a.kind,
+                    a.base(),
+                    &a.account_id,
+                    &a.user_id,
+                    &a.credential,
+                ))
+                .map(|bytes| affinity::hash(&bytes))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         let accounts = config
             .accounts
             .iter()
@@ -89,12 +113,12 @@ impl Pool {
             .build()?;
         Ok(Arc::new(Self {
             config,
+            bindings,
             auth,
             client,
             state: Mutex::new(State {
                 accounts,
-                affinity: HashMap::new(),
-                responses: HashMap::new(),
+                routing,
                 sequence: 0,
                 recent: VecDeque::new(),
             }),
@@ -115,6 +139,8 @@ impl Pool {
             accounts,
             recent: state.recent.iter().cloned().collect(),
             at,
+            routing_persistent: state.routing.persistent(),
+            routing_healthy: state.routing.healthy(),
         }
     }
 
@@ -128,14 +154,17 @@ impl Pool {
     }
 
     pub fn response_account(&self, id: &str) -> Option<usize> {
-        self.state
-            .lock()
-            .unwrap()
-            .responses
-            .get(id)
-            .copied()
-            .filter(|(_, at)| now() < at.saturating_add(AFFINITY_TTL))
-            .map(|(idx, _)| idx)
+        let state = self.state.lock().unwrap();
+        let binding = state
+            .routing
+            .get(RouteKind::Response, &affinity::hash(id.as_bytes()))?;
+        self.bindings
+            .iter()
+            .position(|candidate| candidate == binding)
+    }
+
+    pub fn routing_healthy(&self) -> bool {
+        self.state.lock().unwrap().routing.healthy()
     }
 
     pub fn select(
@@ -147,6 +176,11 @@ impl Pool {
         tried: &[usize],
     ) -> Option<Lease> {
         let mut state = self.state.lock().unwrap();
+        if !state.routing.healthy() {
+            return None;
+        }
+        let session =
+            session.map(|key| affinity::hash(&serde_json::to_vec(&(model, group, key)).unwrap()));
         let timestamp = now();
         let limits = self.config.model_limits.get(model);
         let candidates: Vec<usize> = state
@@ -190,6 +224,17 @@ impl Pool {
                 eligible.then_some(idx)
             })
             .collect();
+        // An eligible established session stays on its account, including after
+        // a higher-priority account recovers. Priority selects new sessions.
+        let affinity = session
+            .as_deref()
+            .and_then(|key| state.routing.get(RouteKind::Session, key))
+            .and_then(|binding| {
+                self.bindings
+                    .iter()
+                    .position(|candidate| candidate == binding)
+            })
+            .filter(|idx| candidates.contains(idx));
         let priority = candidates
             .iter()
             .map(|&idx| self.config.accounts[idx].priority)
@@ -198,10 +243,6 @@ impl Pool {
             .into_iter()
             .filter(|&idx| self.config.accounts[idx].priority == priority)
             .collect();
-        let affinity = session
-            .and_then(|key| state.affinity.get(key))
-            .filter(|(idx, at)| timestamp < at + AFFINITY_TTL && candidates.contains(idx))
-            .map(|(idx, _)| *idx);
         let idx = affinity.or_else(|| {
             candidates.into_iter().min_by_key(|&idx| {
                 let account = &state.accounts[idx];
@@ -215,13 +256,18 @@ impl Pool {
                 (account.in_flight, reset, account.selected)
             })
         })?;
+        if let Some(key) = session
+            && state
+                .routing
+                .remember(RouteKind::Session, key, self.bindings[idx].clone())
+                .is_err()
+        {
+            return None;
+        }
         state.sequence += 1;
         let sequence = state.sequence;
         state.accounts[idx].in_flight += 1;
         state.accounts[idx].selected = sequence;
-        if let Some(key) = session {
-            remember(&mut state.affinity, key, idx, timestamp);
-        }
         Some(Lease {
             pool: self.clone(),
             idx,
@@ -317,7 +363,13 @@ impl Pool {
         let mut state = self.state.lock().unwrap();
         let at = now();
         if let Some(id) = response.and_then(|r| r.get("id")).and_then(Value::as_str) {
-            remember(&mut state.responses, id, idx, at);
+            // A completed upstream response cannot be undone. A storage failure
+            // marks routing unhealthy and blocks later requests until recovery.
+            let _ = state.routing.remember(
+                RouteKind::Response,
+                affinity::hash(id.as_bytes()),
+                self.bindings[idx].clone(),
+            );
         }
         let account = &mut state.accounts[idx];
         account.requests += 1;
@@ -404,24 +456,6 @@ impl Pool {
             .unwrap_or(30)
             .max(1)
     }
-}
-
-fn remember(map: &mut HashMap<String, (usize, u64)>, key: &str, idx: usize, at: u64) {
-    if key.len() > 256 {
-        return;
-    }
-    if map.len() >= AFFINITY_LIMIT {
-        map.retain(|_, (_, seen)| at < seen.saturating_add(AFFINITY_TTL));
-        if map.len() >= AFFINITY_LIMIT
-            && let Some(oldest) = map
-                .iter()
-                .min_by_key(|(_, (_, seen))| seen)
-                .map(|(key, _)| key.clone())
-        {
-            map.remove(&oldest);
-        }
-    }
-    map.insert(key.to_owned(), (idx, at));
 }
 
 pub struct Lease {

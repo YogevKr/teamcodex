@@ -91,7 +91,8 @@ async fn main() -> Result<()> {
             let listener = tokio::net::TcpListener::bind(config.listen)
                 .await
                 .context("cannot bind proxy address")?;
-            let pool = Pool::new(config)?;
+            let pool =
+                Pool::persistent(config, &path.with_extension("state").join("routing.jsonl"))?;
             let app = proxy::router(pool.clone(), token);
             let (stop, mut receiver) = tokio::sync::watch::channel(false);
             let signal_stop = stop.clone();

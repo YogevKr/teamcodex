@@ -166,14 +166,29 @@ async fn handle(State(app): State<App>, request: Request) -> Response {
         .get("x-tcx-group")
         .and_then(|v| v.to_str().ok());
     let session = [
+        "session-id",
         "session_id",
+        "thread-id",
         "x-codex-thread-id",
         "thread_id",
-        "x-client-request-id",
     ]
     .into_iter()
-    .find_map(|name| parts.headers.get(name).and_then(|v| v.to_str().ok()))
-    .or_else(|| value.get("prompt_cache_key").and_then(Value::as_str));
+    .find_map(|name| {
+        parts
+            .headers
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .filter(|v| !v.is_empty())
+    })
+    .or_else(|| {
+        value
+            .get("prompt_cache_key")
+            .and_then(Value::as_str)
+            .filter(|v| !v.is_empty())
+    });
+    if !app.pool.routing_healthy() {
+        return routing_error();
+    }
     let previous = value.get("previous_response_id").and_then(Value::as_str);
     let pinned = match previous {
         Some(id) => match app.pool.response_account(id) {
@@ -306,6 +321,9 @@ async fn handle(State(app): State<App>, request: Request) -> Response {
         )
         .await;
     }
+    if !app.pool.routing_healthy() {
+        return routing_error();
+    }
     let mut response = if app.pool.model_unavailable(model, group, pinned) {
         error(
             StatusCode::NOT_FOUND,
@@ -338,6 +356,14 @@ async fn handle(State(app): State<App>, request: Request) -> Response {
     response
 }
 
+fn routing_error() -> Response {
+    error(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "routing_storage_unavailable",
+        "Routing state could not be saved; repair storage before restarting the proxy",
+    )
+}
+
 enum SendError {
     Connect,
     Unknown,
@@ -361,11 +387,14 @@ async fn send(
         "accept",
         "user-agent",
         "openai-beta",
+        "session-id",
+        "thread-id",
         "session_id",
         "thread_id",
         "x-codex-thread-id",
         "x-client-request-id",
         "x-codex-turn-state",
+        "x-codex-routing-hint",
         "x-codex-turn-metadata",
         "originator",
     ] {

@@ -955,3 +955,141 @@ fn model_cache_is_bounded_and_model_checks_respect_groups_and_configuration() {
     }
     assert_eq!(pool.snapshot().accounts[0].unavailable_models.len(), 256);
 }
+
+#[tokio::test]
+async fn cache_routing_headers_body_and_turn_state_survive_unchanged() {
+    for stable in ["session-id", "thread-id", "session_id", "prompt_cache_key"] {
+        let mock = mock(|_, _, _| {
+            let mut response = Json(completed("resp_cache")).into_response();
+            response.headers_mut().insert(
+                "x-codex-turn-state",
+                "synthetic-turn-state".parse().unwrap(),
+            );
+            response
+        });
+        let source = upstream(&mock).await;
+        let (_, server) = gateway(config(&source.url)).await;
+        let body=br#"{ "model":"test", "prompt_cache_key":"shared-prefix", "prompt_cache_retention":"24h", "instructions":"fixed prefix", "input":[{"role":"user","content":"synthetic"}] }"#;
+        for request_id in ["request-1", "request-2", "request-3"] {
+            let mut request = post(&server)
+                .header("content-type", "application/json")
+                .header("x-client-request-id", request_id)
+                .header("x-codex-routing-hint", "model=test")
+                .header("x-codex-turn-state", "synthetic-turn-state");
+            if stable != "prompt_cache_key" {
+                request = request.header(stable, "stable-session");
+            }
+            let response = request.body(body.to_vec()).send().await.unwrap();
+            assert_eq!(response.status(), 200);
+            assert_eq!(
+                response.headers()["x-codex-turn-state"],
+                "synthetic-turn-state"
+            );
+            response.bytes().await.unwrap();
+        }
+        let calls = mock.calls.lock().unwrap();
+        assert_eq!(calls.len(), 3);
+        for (headers, bytes, _) in calls.iter() {
+            assert_eq!(headers["authorization"], "Bearer test-upstream-a");
+            assert_eq!(bytes, body);
+            assert_eq!(headers["x-codex-routing-hint"], "model=test");
+            assert_eq!(headers["x-codex-turn-state"], "synthetic-turn-state");
+            if stable != "prompt_cache_key" {
+                assert_eq!(headers[stable], "stable-session");
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn request_ids_do_not_create_affinity_and_models_keep_separate_bindings() {
+    let mock = mock(|_, _, _| Json(completed("response")).into_response());
+    let source = upstream(&mock).await;
+    let (pool, server) = gateway(config(&source.url)).await;
+    // A repeated diagnostic request ID is not a conversation identity.
+    for _ in 0..2 {
+        post(&server)
+            .header("x-client-request-id", "diagnostic-only")
+            .json(&json!({"model":"a"}))
+            .send()
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+    }
+    {
+        let calls = mock.calls.lock().unwrap();
+        assert_ne!(calls[0].0["authorization"], calls[1].0["authorization"]);
+    }
+    let first = pool
+        .select("original", None, Some("thread"), None, &[])
+        .unwrap()
+        .idx;
+    pool.mark_model_unavailable(first, "other");
+    let other = pool
+        .select("other", None, Some("thread"), None, &[])
+        .unwrap()
+        .idx;
+    assert_ne!(first, other);
+    assert_eq!(
+        pool.select("original", None, Some("thread"), None, &[])
+            .unwrap()
+            .idx,
+        first
+    );
+}
+
+#[tokio::test]
+async fn established_affinity_survives_priority_recovery_and_restart_with_reordered_accounts() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("routing.jsonl");
+    let mut cfg = config("http://127.0.0.1:1");
+    cfg.accounts[1].priority = 10;
+    let pool = Pool::persistent(cfg.clone(), &path).unwrap();
+    pool.set_enabled("a", false);
+    assert_eq!(
+        pool.select("test", None, Some("session"), None, &[])
+            .unwrap()
+            .idx,
+        1
+    );
+    pool.record(1, 200, "complete", Some(&completed("chain")));
+    pool.set_enabled("a", true);
+    assert_eq!(
+        pool.select("test", None, Some("session"), None, &[])
+            .unwrap()
+            .idx,
+        1
+    );
+    assert_eq!(
+        pool.select("test", None, Some("new-session"), None, &[])
+            .unwrap()
+            .idx,
+        0
+    );
+    drop(pool);
+    cfg.accounts.reverse();
+    let restored = Pool::persistent(cfg.clone(), &path).unwrap();
+    assert_eq!(
+        restored
+            .select("test", None, Some("session"), None, &[])
+            .unwrap()
+            .idx,
+        0
+    );
+    assert_eq!(restored.response_account("chain"), Some(0));
+    assert!(restored.snapshot().routing_persistent);
+    assert!(restored.snapshot().routing_healthy);
+    drop(restored);
+    cfg.accounts[0].account_id = Some("different-account".into());
+    let changed = Pool::persistent(cfg, &path).unwrap();
+    assert_eq!(changed.response_account("chain"), None);
+    assert_eq!(
+        changed
+            .select("test", None, Some("session"), None, &[])
+            .unwrap()
+            .idx,
+        1
+    );
+}
