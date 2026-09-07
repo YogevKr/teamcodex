@@ -172,8 +172,10 @@ def main():
                 if result.returncode or "TEAMCODEX_E2E_OK" not in result.stdout:
                     raise AssertionError("Codex tool cycle failed:\n" + result.stdout[-6000:] + "\n" + result.stderr[-6000:])
                 if not marker.is_file() or marker.read_text() != "TEAMCODEX_TOOL_OK":
+                    outputs = [item for call in observed for item in call["body"].get("input", [])
+                        if isinstance(item, dict) and item.get("type") in ("function_call_output", "custom_tool_call_output")]
                     raise AssertionError("Codex did not create the test marker:\n"
-                        + result.stdout[-6000:] + "\n" + result.stderr[-6000:])
+                        + json.dumps(outputs)[-6000:] + "\n" + result.stdout[-6000:] + "\n" + result.stderr[-6000:])
                 assert len(observed) >= 3, observed
                 assert any(any(item.get("type") == "function_call_output" for item in call["body"].get("input", [])
                     if isinstance(item, dict)) for call in observed), "No tool output returned through proxy"

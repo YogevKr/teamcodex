@@ -27,6 +27,21 @@ It does not copy source from teamclaude-rs or change that project.
 - Terminal display, JSON status, and account controls.
 - A Codex launcher that leaves existing configuration files intact.
 
+## Install
+
+Install through the Homebrew tap:
+
+```sh
+brew install yogevkr/tap/teamcodex
+tcx --version
+tcx example > config.json
+tcx --config config.json check
+```
+
+The installed command is `tcx`. Install Codex CLI separately to use `tcx run`.
+Edit `config.json` with your account names and credential sources before starting the proxy.
+Homebrew installs the credential adapter under `$(brew --prefix teamcodex)/share/teamcodex/examples/`.
+
 ## Build
 
 Use Rust 1.88 or newer, Python 3, and an installed Codex CLI.
