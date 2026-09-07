@@ -16,7 +16,8 @@ It does not copy source from teamclaude-rs or change that project.
 
 ## Features
 
-- ChatGPT account tokens and OpenAI API keys through external credential sources.
+- Browser login for each ChatGPT account, private token storage, and automatic OAuth renewal.
+- Optional credential commands and environment variables for external brokers and OpenAI API keys.
 - A credential command with bounded output, timeout, cache, and concurrent refresh control.
 - Priority tiers, reserved groups, model restrictions, and session affinity.
 - Automatic account selection after an explicit model access rejection.
@@ -35,17 +36,41 @@ Install through the Homebrew tap:
 ```sh
 brew install yogevkr/tap/teamcodex
 tcx --version
-tcx example > config.json
-tcx --config config.json check
+tcx login --name personal
+tcx accounts
+tcx
 ```
 
 The installed command is `tcx`. Install Codex CLI separately to use `tcx run`.
-Edit `config.json` with your account names and credential sources before starting the proxy.
-Homebrew installs the credential adapter under `$(brew --prefix teamcodex)/share/teamcodex/examples/`.
+Repeat `tcx login --name another-account` for each account you want to add.
+Select the intended account in the browser. Login does not change your existing Codex login.
+In another terminal, launch Codex through the running pool:
+
+```sh
+tcx run -- --yolo
+```
+
+Without a running proxy, `tcx run` launches Codex directly with its normal login and configuration.
+An explicit `--group` requires a running proxy. An occupied port with failed authentication never triggers direct launch.
+
+Optional shell aliases:
+
+```sh
+alias tcxs='tcx server'
+alias tcxy='tcx run -- --yolo'
+```
+
+The default configuration is `~/.config/teamcodex/config.json`. Use `--config /absolute/path/config.json` for another pool.
+`tcx login` creates the configuration and local proxy token automatically. No environment variables are required for browser login.
+`tcx login --no-browser` prints the login URL without opening the browser.
+The callback uses loopback port 1455. Close other Codex login attempts if that port is occupied.
+Restart a running server after adding accounts. Re-login to an existing account updates its token file automatically.
+
+Native accounts use both the ChatGPT user ID and workspace ID. Users in the same workspace remain separate. A new login can repair invalid credential JSON for the same configured identity. File permission and symlink checks still apply. Temporary OAuth errors use a retry delay; explicit expired or revoked refresh tokens require login.
 
 ## Build
 
-Use Rust 1.88 or newer, Python 3, and an installed Codex CLI.
+Use Rust 1.89 or newer, Python 3, and an installed Codex CLI.
 The end-to-end test currently verifies Codex CLI 0.153.4.
 
 ```sh
@@ -58,9 +83,27 @@ Update the example with your account names and credential commands.
 Configuration files contain credential references, not credentials.
 `check` validates configuration without reading credentials or contacting an upstream.
 
-## Credentials
+## Managed credentials
 
-Set `client_token_env` to a variable containing a local proxy token.
+Browser login stores each account's access token, refresh token, account ID, and expiry in a separate private file.
+These files live under `~/.config/teamcodex/config.state/accounts/` for the default configuration.
+The local proxy token lives under the same state directory. Configuration contains only file references and account settings.
+Token files use owner-only permissions (`0600`), atomic replacement, and file locks across processes.
+Storage uses local files rather than an operating-system keychain. Keep these files out of source control and shared backups.
+
+The server checks managed accounts every 30 seconds and refreshes access tokens within five minutes of expiry.
+This loop runs even when quota probing is disabled. Concurrent callers share token renewal.
+A 401 can force renewal immediately. A temporary refresh failure keeps an unexpired access token and delays further renewal attempts.
+Rejected refresh credentials require `tcx login` again. Re-login preserves the account's priority, model list, groups, and enabled state.
+`tcx accounts` displays account metadata and login status without displaying tokens.
+
+## External credentials
+
+External credential sources remain optional. `tcx example` prints a configuration for the opgate adapter and API fallback.
+Homebrew installs the adapter under `$(brew --prefix teamcodex)/share/teamcodex/examples/`.
+
+Set `client_token_env` to a variable containing a local proxy token, or set `client_token_file` to its private file.
+When the variable is set, it takes precedence over the file.
 The token must contain at least 16 visible ASCII characters.
 Both the proxy and its clients require this token.
 
@@ -93,7 +136,7 @@ It returns this JSON through its private stdout pipe:
 `expires_at` is an optional Unix timestamp in seconds.
 The proxy rejects tokens that expire within five seconds.
 
-The command owns account login, secure storage, and OAuth token renewal.
+For command sources, the external command owns account login, secure storage, and OAuth token renewal.
 The proxy sets `TEAMCODEX_REFRESH=1` when a 401 response requires renewal.
 Otherwise, it sets `TEAMCODEX_REFRESH=0`.
 Concurrent requests share one refresh. Commands have a 15-second timeout and a 64-KiB output limit.
@@ -130,13 +173,14 @@ opagent ./target/release/tcx --config config.json run -- exec "Explain this repo
 | Field | Behavior |
 | --- | --- |
 | `listen` | Loopback address. Default: `127.0.0.1:4269`. |
-| `client_token_env` | Variable containing the local proxy token. Required. |
+| `client_token_env` | Local proxy token variable. Default: `TEAMCODEX_PROXY_TOKEN`. Optional when a token file is configured. |
+| `client_token_file` | Absolute path to a private local proxy token file. Browser login creates it automatically. |
 | `threshold_percent` | Stop selecting an account at this percentage. Default: `95`. |
 | `probe_interval_seconds` | Usage polling interval. Default: `60`. Set `0` to disable polling. |
 | `idle_timeout_seconds` | Upstream response and stream inactivity limit. Default: `300`. |
 | `model_limits` | Map model names to additional quota bucket IDs. |
 | `prices` | Optional model prices per million tokens, in USD. |
-| `accounts` | Nonempty account list. Names must be unique. |
+| `accounts` | Account list. Names must be unique. The server requires at least one account. |
 
 Each account has a `name`, `kind`, and `credential`.
 `kind` is `chatgpt` or `api`.
@@ -273,6 +317,8 @@ cargo build --locked
 python3 -B -m unittest discover -s scripts -p 'test_*.py'
 python3 scripts/e2e.py
 python3 scripts/e2e.py --model-unavailable
+python3 scripts/e2e.py --managed-credentials --model-unavailable --yolo
+python3 scripts/cli_e2e.py
 python3 scripts/tui_e2e.py
 ```
 
@@ -294,14 +340,17 @@ The terminal test opens a real PTY. It checks rendering, the Space control, and 
 Unit and integration tests cover quota parsing, expired windows, stream boundaries, credential isolation, and concurrent refresh.
 They also check conversation pinning, stream interruption, status, and terminal rendering.
 
+OAuth tests use a local authorization server to verify PKCE, callback validation, token exchange, and account registration.
+Refresh tests verify token rotation, concurrent callers, expiry, temporary failures, and rejected credentials.
+The CLI tests check direct launch, proxy authentication, YOLO argument order, and account-list redaction.
 Local tests use synthetic credentials. They do not prove live ChatGPT or OpenAI account access.
-Live verification requires credentials supplied through the configured source.
+Live verification requires completing `tcx login` or supplying an external credential source.
 
 ## Scope
 
 TeamCodex supports Codex through the Responses API over HTTP and SSE.
-It does not implement WebSocket transport, a macOS menu application, or browser login.
-Account login and OAuth renewal belong to the external credential broker.
+It does not implement WebSocket transport or a macOS menu application.
+Browser OAuth login and token renewal are built in. External credential brokers remain optional.
 The proxy uses each configured account's available quota and respects its reset and hold periods.
 
 Protocol references:
@@ -309,3 +358,5 @@ Protocol references:
 - [Codex provider configuration](https://github.com/openai/codex/blob/main/codex-rs/model-provider-info/src/lib.rs)
 - [Codex quota headers and events](https://github.com/openai/codex/blob/main/codex-rs/codex-api/src/rate_limits.rs)
 - [Codex authentication](https://developers.openai.com/codex/auth)
+- [Codex browser OAuth flow](https://github.com/openai/codex/blob/rust-v0.153.4/codex-rs/login/src/server.rs)
+- [Codex token refresh](https://github.com/openai/codex/blob/rust-v0.153.4/codex-rs/login/src/auth/manager.rs)

@@ -71,13 +71,14 @@ async fn serve(app: Router) -> Server {
 
 fn config(base: &str) -> Config {
     Config {
-        listen: "127.0.0.1:0".parse().unwrap(), client_token_env: "TEST_CLIENT_TOKEN".into(),
+        listen: "127.0.0.1:0".parse().unwrap(), client_token_env: "TEST_CLIENT_TOKEN".into(), client_token_file: None,
         threshold_percent: 95.0, probe_interval_seconds: 0, idle_timeout_seconds: 2,
         model_limits: HashMap::new(),
         prices: HashMap::new(),
         accounts: ["a", "b"].into_iter().map(|name| Account {
             name: name.into(), kind: Kind::Api, base_url: Some(base.into()), usage_url: None,
             account_id: None,
+            user_id: None,
             credential: Credential::Command {
                 argv: vec!["python3".into(), "-c".into(), format!("import json; print(json.dumps({{'access_token':'test-upstream-{name}'}}))")],
                 cache_seconds: 240,

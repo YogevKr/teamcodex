@@ -1,10 +1,13 @@
 pub mod auth;
 pub mod config;
+pub mod login;
 pub mod models;
+pub mod oauth;
 pub mod pool;
 pub mod proxy;
 pub mod quota;
 pub mod sse;
+pub mod storage;
 pub mod tui;
 
 pub fn now() -> u64 {

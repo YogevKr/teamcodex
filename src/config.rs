@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
     net::SocketAddr,
-    path::Path,
+    path::{Path, PathBuf},
 };
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -11,7 +11,10 @@ use std::{
 pub struct Config {
     #[serde(default = "listen")]
     pub listen: SocketAddr,
+    #[serde(default = "client_token_env")]
     pub client_token_env: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_token_file: Option<PathBuf>,
     #[serde(default = "threshold")]
     pub threshold_percent: f64,
     #[serde(default = "probe_interval")]
@@ -22,6 +25,7 @@ pub struct Config {
     pub model_limits: HashMap<String, Vec<String>>,
     #[serde(default)]
     pub prices: HashMap<String, Price>,
+    #[serde(default)]
     pub accounts: Vec<Account>,
 }
 
@@ -44,6 +48,8 @@ pub struct Account {
     pub usage_url: Option<String>,
     #[serde(default)]
     pub account_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_id: Option<String>,
     pub credential: Credential,
     #[serde(default)]
     pub priority: i32,
@@ -65,6 +71,9 @@ pub enum Kind {
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Credential {
+    Managed {
+        path: PathBuf,
+    },
     Env {
         name: String,
     },
@@ -77,6 +86,28 @@ pub enum Credential {
 
 fn listen() -> SocketAddr {
     "127.0.0.1:4269".parse().unwrap()
+}
+fn client_token_env() -> String {
+    "TEAMCODEX_PROXY_TOKEN".to_owned()
+}
+
+pub fn default_path() -> Result<PathBuf> {
+    Ok(
+        PathBuf::from(std::env::var_os("HOME").context("HOME is not set; use --config")?)
+            .join(".config/teamcodex/config.json"),
+    )
+}
+
+pub fn validate_name(name: &str) -> Result<()> {
+    ensure!(
+        !name.is_empty()
+            && name.len() <= 64
+            && name
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b)),
+        "account names must contain 1-64 letters, digits, dots, underscores, or hyphens"
+    );
+    Ok(())
 }
 fn threshold() -> f64 {
     95.0
@@ -111,6 +142,25 @@ impl Account {
 }
 
 impl Config {
+    pub fn local(path: &Path) -> Self {
+        Self {
+            listen: listen(),
+            client_token_env: client_token_env(),
+            client_token_file: Some(path.with_extension("state").join("proxy.token")),
+            threshold_percent: threshold(),
+            probe_interval_seconds: probe_interval(),
+            idle_timeout_seconds: idle_timeout(),
+            model_limits: HashMap::new(),
+            prices: HashMap::new(),
+            accounts: Vec::new(),
+        }
+    }
+
+    pub fn save(&self, path: &Path) -> Result<()> {
+        self.validate()?;
+        crate::storage::atomic_write(path, &serde_json::to_vec_pretty(self)?)
+    }
+
     pub fn load(path: &Path) -> Result<Self> {
         let bytes = std::fs::read(path).context("cannot read configuration")?;
         let config: Self = serde_json::from_slice(&bytes).map_err(|_| {
@@ -129,10 +179,12 @@ impl Config {
             !self.client_token_env.is_empty(),
             "client_token_env is required"
         );
-        ensure!(
-            !self.accounts.is_empty(),
-            "at least one account is required"
-        );
+        if let Some(path) = &self.client_token_file {
+            ensure!(
+                path.is_absolute(),
+                "client_token_file must be an absolute path"
+            );
+        }
         ensure!(
             self.threshold_percent.is_finite()
                 && self.threshold_percent > 0.0
@@ -157,14 +209,7 @@ impl Config {
             );
         }
         for a in &self.accounts {
-            ensure!(
-                !a.name.is_empty()
-                    && a.name.len() <= 64
-                    && a.name
-                        .bytes()
-                        .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b)),
-                "account names must contain 1-64 letters, digits, dots, underscores, or hyphens"
-            );
+            validate_name(&a.name)?;
             ensure!(names.insert(&a.name), "duplicate account name");
             validate_url(a.base())?;
             if let Some(url) = a.usage() {
@@ -181,6 +226,25 @@ impl Config {
                 );
             }
             match &a.credential {
+                Credential::Managed { path } => {
+                    ensure!(
+                        a.account_id
+                            .as_ref()
+                            .is_some_and(|id| !id.is_empty() && id.len() <= 256)
+                            && a.user_id
+                                .as_ref()
+                                .is_some_and(|id| !id.is_empty() && id.len() <= 256),
+                        "managed credentials require account_id and user_id"
+                    );
+                    ensure!(
+                        path.is_absolute(),
+                        "managed credential path must be absolute"
+                    );
+                    ensure!(
+                        a.kind == Kind::Chatgpt,
+                        "managed OAuth credentials require a ChatGPT account"
+                    );
+                }
                 Credential::Env { name } => {
                     ensure!(!name.is_empty(), "credential variable is required")
                 }
@@ -200,13 +264,32 @@ impl Config {
     }
 
     pub fn client_token(&self) -> Result<String> {
-        let token =
-            std::env::var(&self.client_token_env).context("client token variable is not set")?;
+        let token = match std::env::var(&self.client_token_env) {
+            Ok(token) => token,
+            Err(std::env::VarError::NotPresent) => {
+                let path = self
+                    .client_token_file
+                    .as_ref()
+                    .context("client token variable is not set")?;
+                String::from_utf8(crate::storage::read_private(path)?)
+                    .context("invalid local proxy token")?
+            }
+            Err(_) => anyhow::bail!("invalid local proxy token variable"),
+        };
         ensure!(
             token.len() >= 16 && token.bytes().all(|b| b.is_ascii_graphic()),
             "client token must contain at least 16 visible ASCII characters"
         );
         Ok(token)
+    }
+
+    pub async fn prepare_client_token(&self) -> Result<String> {
+        if std::env::var_os(&self.client_token_env).is_none()
+            && let Some(path) = &self.client_token_file
+        {
+            crate::storage::local_token(path).await?;
+        }
+        self.client_token()
     }
 }
 
@@ -229,4 +312,33 @@ fn validate_url(value: &str) -> Result<()> {
         "upstream URLs must not contain credentials, queries, or fragments"
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn managed_accounts_require_complete_identity() {
+        let mut config = Config::local(Path::new("/tmp/teamcodex/config.json"));
+        let valid = serde_json::json!({"name":"personal", "kind":"chatgpt",
+            "account_id":"workspace-a", "user_id":"user-a",
+            "credential":{"type":"managed", "path":"/tmp/teamcodex/account.json"}});
+        config
+            .accounts
+            .push(serde_json::from_value(valid.clone()).unwrap());
+        assert!(config.validate().is_ok());
+        for field in ["account_id", "user_id"] {
+            for value in [serde_json::Value::Null, serde_json::json!("")] {
+                let mut invalid = valid.clone();
+                invalid[field] = value;
+                config.accounts[0] = serde_json::from_value(invalid).unwrap();
+                assert!(config.validate().is_err());
+            }
+        }
+        config.accounts[0] = serde_json::from_value(serde_json::json!({"name":"external",
+            "kind":"api", "credential":{"type":"env", "name":"SYNTHETIC_TEST_KEY"}}))
+        .unwrap();
+        assert!(config.validate().is_ok());
+    }
 }

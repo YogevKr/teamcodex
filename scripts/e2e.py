@@ -49,6 +49,8 @@ def main():
     parser.add_argument("--skip-codex", action="store_true")
     parser.add_argument("--model-unavailable", action="store_true",
         help="First account rejects the model instead of returning a rate limit")
+    parser.add_argument("--managed-credentials", action="store_true", help="Use private account files instead of credential commands")
+    parser.add_argument("--yolo", action="store_true", help="Test the YOLO alias argument order with the fixed local mock command")
     parser.add_argument("--sandbox", choices=("workspace-write", "danger-full-access"), default="workspace-write",
         help="Codex tool sandbox; CI runners without user namespaces require danger-full-access")
     args = parser.parse_args()
@@ -145,10 +147,25 @@ def main():
                 for name in ("a", "b")],
         }
         config_path = workspace / "config.json"
+        if args.managed_credentials:
+            token_path = workspace / "proxy.token"
+            token_path.write_text(CLIENT_TOKEN)
+            token_path.chmod(0o600)
+            config["client_token_file"] = str(token_path)
+            for account in config["accounts"]:
+                path = workspace / (account["name"] + ".json")
+                account_id = "test-account-" + account["name"]
+                path.write_text(json.dumps({"access_token": "test-upstream-" + account["name"],
+                    "refresh_token": "synthetic-unused-refresh", "account_id": account_id, "user_id": "user-a",
+                    "expires_at": int(time.time()) + 3600, "email": None}))
+                path.chmod(0o600)
+                account.update(kind="chatgpt", account_id=account_id, user_id="user-a", credential={"type": "managed", "path": str(path)})
         config_path.write_text(json.dumps(config))
         # If Codex loses the selected provider, its default endpoint must still
         # stay local. The upstream assertions also require the selected account.
         env = dict(os.environ, TEAMCODEX_E2E_TOKEN=CLIENT_TOKEN, OPENAI_BASE_URL=url + "/v1")
+        if args.managed_credentials:
+            env.pop("TEAMCODEX_E2E_TOKEN", None)
         command = [binary, "--config", str(config_path)]
         subprocess.run(command + ["check"], check=True, capture_output=True, env=env)
         process = subprocess.Popen(command + ["server", "--headless"], env=env,
@@ -170,8 +187,9 @@ def main():
                 with urllib.request.urlopen(req, timeout=10) as response:
                     assert b"TEAMCODEX_PROCESS_OK" in response.read()
             else:
-                result = subprocess.run(command + ["run", "--", "exec", "--ignore-user-config", "--ignore-rules",
-                    "--ephemeral", "--skip-git-repo-check", "--sandbox", args.sandbox, "--json",
+                launch = ["--yolo", "exec"] if args.yolo else ["exec", "--sandbox", args.sandbox]
+                result = subprocess.run(command + ["run", "--"] + launch + ["--ignore-user-config", "--ignore-rules",
+                    "--ephemeral", "--skip-git-repo-check", "--json",
                     "-c", 'cli_auth_credentials_store="ephemeral"',
                     "-c", 'model="gpt-5.3-codex"',
                     "-c", 'model_reasoning_effort="low"',
@@ -200,6 +218,9 @@ def main():
             assert status["accounts"][1]["input_tokens"] >= 20
             assert status["accounts"][1]["in_flight"] == 0
             assert "test-upstream" not in status_result.stdout
+            accounts_result = subprocess.run(command + ["accounts"], env=env, capture_output=True, text=True, check=True)
+            assert "test-upstream" not in accounts_result.stdout
+            assert "synthetic-unused-refresh" not in accounts_result.stdout
             subprocess.run(command + ["account", "b", "disable"], env=env, capture_output=True, check=True)
             assert request(url, "/status")["accounts"][1]["disabled"]
             subprocess.run(command + ["account", "b", "enable"], env=env, capture_output=True, check=True)
@@ -207,6 +228,7 @@ def main():
             print(json.dumps({"result": "PASS", "codex_tool_cycle": not args.skip_codex,
                 "upstream_requests": len(observed), "failover": True, "status": True,
                 "failover_reason": "model_unavailable" if args.model_unavailable else "rate_limit",
+                "managed_credentials": args.managed_credentials, "yolo_launch": args.yolo,
                 "account_controls": True, "input_tokens": status["accounts"][1]["input_tokens"]}, indent=2))
         finally:
             if process.poll() is None:

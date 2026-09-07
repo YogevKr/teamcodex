@@ -2103,17 +2103,20 @@ dependencies = [
 
 [[package]]
 name = "teamcodex"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "async-stream",
  "axum",
+ "base64",
  "bytes",
  "clap",
  "futures-util",
  "httpdate",
+ "libc",
  "ratatui",
  "reqwest",
+ "ring",
  "serde",
  "serde_json",
  "tempfile",

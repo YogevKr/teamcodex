@@ -1,8 +1,8 @@
 [package]
 name = "teamcodex"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.89"
 description = "A local account pool and streaming proxy for Codex"
 license = "MIT"
 publish = false
@@ -15,12 +15,15 @@ path = "src/main.rs"
 anyhow = "1"
 async-stream = "0.3"
 axum = "0.8"
+base64 = "0.22"
 bytes = "1"
 clap = { version = "4", features = ["derive"] }
 futures-util = "0.3"
 httpdate = "1"
+libc = "0.2"
 ratatui = "0.30"
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+ring = "0.17"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal", "sync", "time", "process", "io-util"] }
