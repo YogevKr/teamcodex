@@ -47,6 +47,8 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--binary", default=str(ROOT / "target/debug/tcx"))
     parser.add_argument("--skip-codex", action="store_true")
+    parser.add_argument("--sandbox", choices=("workspace-write", "danger-full-access"), default="workspace-write",
+        help="Codex tool sandbox; CI runners without user namespaces require danger-full-access")
     args = parser.parse_args()
     binary = str(Path(args.binary).resolve())
     if not args.skip_codex and not shutil.which("codex"):
@@ -163,10 +165,7 @@ def main():
                     assert b"TEAMCODEX_PROCESS_OK" in response.read()
             else:
                 result = subprocess.run(command + ["run", "--", "exec", "--ignore-user-config", "--ignore-rules",
-                    "--ephemeral", "--skip-git-repo-check", "--sandbox", "workspace-write", "--json",
-                    # Hosted Linux runners cannot configure bubblewrap's loopback
-                    # namespace. Keep filesystem isolation and use the host network.
-                    "-c", "sandbox_workspace_write.network_access=true",
+                    "--ephemeral", "--skip-git-repo-check", "--sandbox", args.sandbox, "--json",
                     "-c", 'cli_auth_credentials_store="ephemeral"',
                     "-c", 'model="gpt-5.3-codex"',
                     "-c", 'model_reasoning_effort="low"',

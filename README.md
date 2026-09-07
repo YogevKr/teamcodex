@@ -263,6 +263,9 @@ It runs the installed Codex CLI through `tcx run`.
 The first account returns 429. The second account requests a file write in a temporary workspace.
 Codex executes the command and returns its result through the proxy.
 The test checks the final response, account change, token totals, and account controls.
+Local tests use Codex's `workspace-write` sandbox by default.
+The disposable Linux CI runner blocks sandbox user namespaces, so that job passes `--sandbox danger-full-access`.
+Its local mock supplies only the fixed marker command. This option does not change `tcx` defaults.
 
 `python3 scripts/e2e.py --skip-codex` runs the process smoke test without Codex.
 It does not verify the Codex tool cycle.

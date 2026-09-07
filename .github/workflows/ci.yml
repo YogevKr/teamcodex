@@ -22,5 +22,8 @@ jobs:
       - run: cargo test --locked
       - run: cargo build --locked
       - run: python3 -B -m unittest discover -s scripts -p 'test_*.py'
-      - run: python3 scripts/e2e.py
+      - name: Test Codex tool cycle
+        # Ubuntu runners block bubblewrap user namespaces. This test runs only
+        # a fixed printf command from a local mock in a temporary workspace.
+        run: python3 scripts/e2e.py --sandbox ${{ runner.os == 'Linux' && 'danger-full-access' || 'workspace-write' }}
       - run: python3 scripts/tui_e2e.py
