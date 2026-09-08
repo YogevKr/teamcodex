@@ -296,8 +296,6 @@ fn provider_settings(config: &Config) -> Vec<String> {
         "model_providers.teamcodex.wire_api=\"responses\"".into(),
         "model_providers.teamcodex.requires_openai_auth=false".into(),
         "model_providers.teamcodex.supports_websockets=false".into(),
-        "model_providers.teamcodex.request_max_retries=0".into(),
-        "model_providers.teamcodex.stream_max_retries=0".into(),
     ]
 }
 

@@ -29,5 +29,6 @@ jobs:
           python3 scripts/e2e.py --sandbox ${{ runner.os == 'Linux' && 'danger-full-access' || 'workspace-write' }}
           python3 scripts/e2e.py --model-unavailable --sandbox ${{ runner.os == 'Linux' && 'danger-full-access' || 'workspace-write' }}
           python3 scripts/e2e.py --managed-credentials --model-unavailable --yolo
+          python3 scripts/e2e.py --transient-error --sandbox ${{ runner.os == 'Linux' && 'danger-full-access' || 'workspace-write' }}
       - run: python3 scripts/cli_e2e.py
       - run: python3 scripts/tui_e2e.py

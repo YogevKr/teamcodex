@@ -47,6 +47,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--binary", default=str(ROOT / "target/debug/tcx"))
     parser.add_argument("--skip-codex", action="store_true")
+    parser.add_argument("--transient-error", action="store_true", help="Return one 503 before the tool cycle")
     parser.add_argument("--model-unavailable", action="store_true",
         help="First account rejects the model instead of returning a rate limit")
     parser.add_argument("--managed-credentials", action="store_true", help="Use private account files instead of credential commands")
@@ -54,6 +55,8 @@ def main():
     parser.add_argument("--sandbox", choices=("workspace-write", "danger-full-access"), default="workspace-write",
         help="Codex tool sandbox; CI runners without user namespaces require danger-full-access")
     args = parser.parse_args()
+    if args.transient_error and args.skip_codex:
+        parser.error("--transient-error requires Codex; do not use --skip-codex")
     binary = str(Path(args.binary).resolve())
     if not args.skip_codex and not shutil.which("codex"):
         raise SystemExit("Codex CLI is required; install it or use --skip-codex for the process smoke test")
@@ -84,6 +87,14 @@ def main():
                 with lock:
                     observed.append({"token": token, "body": payload, "path": self.path})
                     number = len(observed)
+                if args.transient_error and number == 1:
+                    failure = b"upstream connect error or disconnect/reset before headers. Connection refused"
+                    self.send_response(503)
+                    self.send_header("Content-Type", "text/plain")
+                    self.send_header("Content-Length", str(len(failure)))
+                    self.end_headers()
+                    self.wfile.write(failure)
+                    return
                 if token == "Bearer test-upstream-a":
                     failure = json.dumps({"error": {"code": "model_not_found"}}).encode() if args.model_unavailable else b""
                     self.send_response(404 if args.model_unavailable else 429)
@@ -206,7 +217,12 @@ def main():
                 assert any(any(item.get("type") == "function_call_output" for item in call["body"].get("input", [])
                     if isinstance(item, dict)) for call in observed), "No tool output returned through proxy"
             assert observed[0]["token"] == "Bearer test-upstream-a"
-            assert all(call["token"] == "Bearer test-upstream-b" for call in observed[1:])
+            first_b = 2 if args.transient_error else 1
+            assert all(call["token"] == "Bearer test-upstream-a" for call in observed[:first_b])
+            assert all(call["token"] == "Bearer test-upstream-b" for call in observed[first_b:])
+            assert observed[0]["body"] == observed[first_b]["body"]
+            if args.transient_error:
+                assert observed[0] == observed[1], "Retry changed the request"
             assert observed[0]["body"] == observed[1]["body"], "Failover changed the request body"
             status_result = subprocess.run(command + ["status"], env=env, capture_output=True, text=True, check=True)
             status = json.loads(status_result.stdout)
@@ -227,6 +243,7 @@ def main():
             assert not request(url, "/status")["accounts"][1]["disabled"]
             print(json.dumps({"result": "PASS", "codex_tool_cycle": not args.skip_codex,
                 "upstream_requests": len(observed), "failover": True, "status": True,
+                "transient_error_recovered": args.transient_error,
                 "failover_reason": "model_unavailable" if args.model_unavailable else "rate_limit",
                 "managed_credentials": args.managed_credentials, "yolo_launch": args.yolo,
                 "account_controls": True, "input_tokens": status["accounts"][1]["input_tokens"]}, indent=2))

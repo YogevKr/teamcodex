@@ -260,7 +260,7 @@ Use Space to change its state. Use `q` to stop the server.
 
 `codex-config` prints TOML settings for manual setup.
 `run` passes these settings to Codex for one process.
-It selects HTTP streaming and disables Codex request retries for this provider.
+It selects HTTP streaming and leaves Codex request and stream retries at their normal defaults.
 The proxy handles the permitted account changes.
 
 ## HTTP interface
@@ -286,6 +286,8 @@ It drops upstream cookies and authentication headers from responses.
 Browser requests with an `Origin` header receive 403.
 
 ## Retry and conversation rules
+
+These rules describe proxy attempts. Codex controls client retries and can submit another request after a returned error.
 
 - A 401 response triggers one credential refresh and one retry on that account.
 - A second 401 puts that account on hold and selects another eligible account.
@@ -334,6 +336,7 @@ cargo build --locked
 python3 -B -m unittest discover -s scripts -p 'test_*.py'
 python3 scripts/e2e.py
 python3 scripts/e2e.py --model-unavailable
+python3 scripts/e2e.py --transient-error
 python3 scripts/e2e.py --managed-credentials --model-unavailable --yolo
 python3 scripts/cli_e2e.py
 python3 scripts/tui_e2e.py
