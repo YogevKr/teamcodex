@@ -434,7 +434,9 @@ impl Pool {
         });
     }
 
-    pub fn retry_seconds(&self) -> u64 {
+    /// Earliest future time, in Unix seconds, when a hold, model restriction,
+    /// or exhausted quota window clears on any account.
+    pub fn reset_at(&self) -> Option<u64> {
         let state = self.state.lock().unwrap();
         let timestamp = now();
         state
@@ -452,7 +454,11 @@ impl Pool {
             })
             .filter(|at| *at > timestamp)
             .min()
-            .map(|at| at - timestamp)
+    }
+
+    pub fn retry_seconds(&self) -> u64 {
+        self.reset_at()
+            .map(|at| at.saturating_sub(now()))
             .unwrap_or(30)
             .max(1)
     }

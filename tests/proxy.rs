@@ -10,7 +10,7 @@ use bytes::Bytes;
 use futures_util::StreamExt;
 use serde_json::{Value, json};
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     sync::{
         Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
@@ -373,6 +373,49 @@ async fn authentication_routes_and_control_do_not_reach_upstream() {
         .unwrap();
     assert_eq!(exhausted.status(), 429);
     assert!(exhausted.headers().contains_key("retry-after"));
+    let body: Value = exhausted.json().await.unwrap();
+    assert_eq!(body["error"]["type"], "usage_limit_reached");
+    assert_eq!(body["error"]["code"], "pool_exhausted");
+    assert!(body["error"].get("resets_at").is_none());
+    assert!(mock.calls.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn exhausted_quota_reports_codex_usage_limit_with_earliest_reset() {
+    let mock = mock(|_, _, _| Json(completed("resp_test")).into_response());
+    let source = upstream(&mock).await;
+    let (pool, server) = gateway(config(&source.url)).await;
+    let later = now() + 3600;
+    let sooner = now() + 600;
+    for (idx, reset_at) in [(0, later), (1, sooner)] {
+        pool.update_quotas(
+            idx,
+            BTreeMap::from([(
+                "codex-primary".to_string(),
+                Window {
+                    used_percent: 100.0,
+                    reset_at: Some(reset_at),
+                    window_minutes: Some(10080),
+                },
+            )]),
+        );
+    }
+    let exhausted = post(&server)
+        .json(&json!({"model":"test"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(exhausted.status(), 429);
+    let retry_after: u64 = exhausted.headers()["retry-after"]
+        .to_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!((590..=600).contains(&retry_after), "{retry_after}");
+    let body: Value = exhausted.json().await.unwrap();
+    assert_eq!(body["error"]["type"], "usage_limit_reached");
+    assert_eq!(body["error"]["code"], "pool_exhausted");
+    assert_eq!(body["error"]["resets_at"], sooner);
     assert!(mock.calls.lock().unwrap().is_empty());
 }
 

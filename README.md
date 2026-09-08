@@ -214,6 +214,8 @@ The proxy recognizes `model_not_found`, `model_access_denied`, and the explicit 
 Generic permission, parameter, endpoint, and safety errors pass through without account changes.
 If every matching account excludes the model, the proxy returns HTTP 404 with code `model_unavailable`.
 Quota exhaustion still returns HTTP 429. The proxy does not substitute a different model.
+That 429 body uses error type `usage_limit_reached` with code `pool_exhausted` and, when known, `resets_at` in Unix seconds.
+Codex reads this type as a final usage-limit error and shows the reset time instead of retrying the bare status.
 
 Configure model buckets explicitly. The proxy does not guess model names from bucket labels.
 It always applies the default Codex bucket and adds the configured buckets.

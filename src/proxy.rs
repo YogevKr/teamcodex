@@ -43,6 +43,21 @@ fn error(status: StatusCode, code: &str, message: &str) -> Response {
         .into_response()
 }
 
+/// Codex parses a 429 body with `type: usage_limit_reached` as a final
+/// usage-limit error and reports `resets_at` instead of retrying a bare 429.
+/// `code` stays `pool_exhausted` for proxy clients.
+fn pool_exhausted(resets_at: Option<u64>) -> Response {
+    let mut body = json!({"error":{
+        "type":"usage_limit_reached",
+        "code":"pool_exhausted",
+        "message":"No account is eligible; wait for quota reset or enable an account",
+    }});
+    if let Some(at) = resets_at {
+        body["error"]["resets_at"] = json!(at);
+    }
+    (StatusCode::TOO_MANY_REQUESTS, Json(body)).into_response()
+}
+
 fn authorized(headers: &HeaderMap, expected: &str) -> bool {
     let Some(actual) = headers
         .get("authorization")
@@ -342,11 +357,7 @@ async fn handle(State(app): State<App>, request: Request) -> Response {
             "Cannot connect to an eligible upstream",
         )
     } else {
-        error(
-            StatusCode::TOO_MANY_REQUESTS,
-            "pool_exhausted",
-            "No account is eligible; wait for quota reset or enable an account",
-        )
+        pool_exhausted(app.pool.reset_at())
     };
     response.headers_mut().insert(
         "retry-after",
