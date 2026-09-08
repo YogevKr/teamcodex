@@ -1,16 +1,20 @@
 use crate::{
     affinity::{self, Kind as RouteKind, Routing},
     auth::Auth,
-    config::Config,
+    config::{Account, Config},
     now,
     quota::{self, Quotas},
 };
+use anyhow::Context;
 use serde::Serialize;
 use serde_json::Value;
 use std::{
     collections::{HashMap, VecDeque},
-    sync::{Arc, Mutex},
+    path::PathBuf,
+    sync::{Arc, Mutex, OnceLock, RwLock},
 };
+
+const REMOVED_FROM_CONFIG: &str = "removed_from_config";
 
 const MODEL_RETRY_SECONDS: u64 = 300;
 const MODEL_CACHE_LIMIT: usize = 256;
@@ -62,14 +66,56 @@ pub struct State {
     recent: VecDeque<RequestLog>,
 }
 
-pub struct Pool {
-    pub config: Config,
-    pub auth: Vec<Auth>,
-    pub state: Mutex<State>,
-    pub client: reqwest::Client,
-    bindings: Vec<String>,
+/// One configured account with its credential cache and durable routing binding.
+pub struct Entry {
+    pub account: Account,
+    pub auth: Arc<Auth>,
+    pub binding: String,
 }
 
+impl Entry {
+    fn new(account: Account) -> anyhow::Result<Self> {
+        let binding = binding(&account)?;
+        Ok(Self {
+            account,
+            auth: Arc::new(Auth::default()),
+            binding,
+        })
+    }
+}
+
+fn binding(a: &Account) -> anyhow::Result<String> {
+    let bytes = serde_json::to_vec(&(
+        &a.name,
+        a.kind,
+        a.base(),
+        &a.account_id,
+        &a.user_id,
+        &a.credential,
+    ))?;
+    Ok(affinity::hash(&bytes))
+}
+
+/// Outcome of applying a configuration file to the running pool.
+#[derive(Debug, Default, PartialEq, Eq, Serialize)]
+pub struct Reload {
+    pub added: Vec<String>,
+    pub updated: Vec<String>,
+    pub removed: Vec<String>,
+    /// Settings other than `accounts` changed. They apply on the next start.
+    pub restart_required: bool,
+}
+
+pub struct Pool {
+    /// Startup settings. `accounts` is empty here; the live list is behind `accounts()`.
+    pub config: Config,
+    accounts: RwLock<Vec<Entry>>,
+    pub state: Mutex<State>,
+    pub client: reqwest::Client,
+    config_path: OnceLock<PathBuf>,
+}
+
+// Lock order: `accounts` (read or write) before `state`. Never hold either across an await.
 impl Pool {
     pub fn new(config: Config) -> anyhow::Result<Arc<Self>> {
         Self::with_routing(config, Routing::default())
@@ -79,33 +125,20 @@ impl Pool {
         Self::with_routing(config, Routing::open(path)?)
     }
 
-    fn with_routing(config: Config, routing: Routing) -> anyhow::Result<Arc<Self>> {
+    fn with_routing(mut config: Config, routing: Routing) -> anyhow::Result<Arc<Self>> {
         config.validate()?;
-        let bindings = config
-            .accounts
+        let entries = std::mem::take(&mut config.accounts)
+            .into_iter()
+            .map(Entry::new)
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let accounts = entries
             .iter()
-            .map(|a| {
-                serde_json::to_vec(&(
-                    &a.name,
-                    a.kind,
-                    a.base(),
-                    &a.account_id,
-                    &a.user_id,
-                    &a.credential,
-                ))
-                .map(|bytes| affinity::hash(&bytes))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let accounts = config
-            .accounts
-            .iter()
-            .map(|a| AccountState {
-                name: a.name.clone(),
-                disabled: a.disabled,
+            .map(|e| AccountState {
+                name: e.account.name.clone(),
+                disabled: e.account.disabled,
                 ..Default::default()
             })
             .collect();
-        let auth = config.accounts.iter().map(|_| Auth::default()).collect();
         let client = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(std::time::Duration::from_secs(10))
@@ -113,8 +146,7 @@ impl Pool {
             .build()?;
         Ok(Arc::new(Self {
             config,
-            bindings,
-            auth,
+            accounts: RwLock::new(entries),
             client,
             state: Mutex::new(State {
                 accounts,
@@ -122,7 +154,121 @@ impl Pool {
                 sequence: 0,
                 recent: VecDeque::new(),
             }),
+            config_path: OnceLock::new(),
         }))
+    }
+
+    /// Track the configuration file so `reload_from_disk` and the watcher can read it.
+    pub fn set_config_path(&self, path: PathBuf) -> bool {
+        self.config_path.set(path).is_ok()
+    }
+
+    pub fn config_path(&self) -> Option<PathBuf> {
+        self.config_path.get().cloned()
+    }
+
+    pub fn len(&self) -> usize {
+        self.accounts.read().unwrap().len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn account(&self, idx: usize) -> Option<Account> {
+        self.accounts
+            .read()
+            .unwrap()
+            .get(idx)
+            .map(|e| e.account.clone())
+    }
+
+    /// Owned account and credential cache, safe to use across awaits.
+    pub fn entry(&self, idx: usize) -> Option<(Account, Arc<Auth>)> {
+        self.accounts
+            .read()
+            .unwrap()
+            .get(idx)
+            .map(|e| (e.account.clone(), e.auth.clone()))
+    }
+
+    pub fn entries(&self) -> Vec<(usize, Account, Arc<Auth>)> {
+        self.accounts
+            .read()
+            .unwrap()
+            .iter()
+            .enumerate()
+            .map(|(idx, e)| (idx, e.account.clone(), e.auth.clone()))
+            .collect()
+    }
+
+    pub fn reload_from_disk(&self) -> anyhow::Result<Reload> {
+        let path = self
+            .config_path
+            .get()
+            .context("configuration path is not tracked; restart the server")?;
+        self.reload(Config::load(path)?)
+    }
+
+    /// Apply a configuration to the running pool without a restart.
+    /// New accounts are appended. Existing accounts are updated in place; a changed
+    /// identity or credential resets its credential cache and routing binding.
+    /// Accounts missing from the file are disabled and keep their index.
+    pub fn reload(&self, mut config: Config) -> anyhow::Result<Reload> {
+        config.validate()?;
+        let incoming = std::mem::take(&mut config.accounts);
+        let mut summary = Reload {
+            restart_required: serde_json::to_value(&self.config)? != serde_json::to_value(&config)?,
+            ..Default::default()
+        };
+        let mut entries = self.accounts.write().unwrap();
+        let mut state = self.state.lock().unwrap();
+        let mut present = vec![false; entries.len()];
+        for account in incoming {
+            let Some(idx) = entries.iter().position(|e| e.account.name == account.name) else {
+                summary.added.push(account.name.clone());
+                state.accounts.push(AccountState {
+                    name: account.name.clone(),
+                    disabled: account.disabled,
+                    ..Default::default()
+                });
+                entries.push(Entry::new(account)?);
+                continue;
+            };
+            present[idx] = true;
+            let entry = &mut entries[idx];
+            let live = &mut state.accounts[idx];
+            let restored = live.last_error.as_deref() == Some(REMOVED_FROM_CONFIG);
+            let binding = binding(&account)?;
+            if serde_json::to_value(&entry.account)? == serde_json::to_value(&account)? && !restored
+            {
+                continue;
+            }
+            if entry.binding != binding {
+                entry.auth = Arc::new(Auth::default());
+                entry.binding = binding;
+                live.quotas.clear();
+                live.unavailable_models.clear();
+                live.hold_until = 0;
+            }
+            if restored || entry.account.disabled != account.disabled {
+                live.disabled = account.disabled;
+            }
+            if restored {
+                live.last_error = None;
+            }
+            entry.account = account;
+            summary.updated.push(entry.account.name.clone());
+        }
+        for (idx, seen) in present.into_iter().enumerate() {
+            let live = &mut state.accounts[idx];
+            if !seen && live.last_error.as_deref() != Some(REMOVED_FROM_CONFIG) {
+                live.disabled = true;
+                live.last_error = Some(REMOVED_FROM_CONFIG.to_owned());
+                summary.removed.push(live.name.clone());
+            }
+        }
+        Ok(summary)
     }
 
     pub fn snapshot(&self) -> Snapshot {
@@ -154,13 +300,12 @@ impl Pool {
     }
 
     pub fn response_account(&self, id: &str) -> Option<usize> {
+        let entries = self.accounts.read().unwrap();
         let state = self.state.lock().unwrap();
         let binding = state
             .routing
             .get(RouteKind::Response, &affinity::hash(id.as_bytes()))?;
-        self.bindings
-            .iter()
-            .position(|candidate| candidate == binding)
+        entries.iter().position(|e| e.binding == binding)
     }
 
     pub fn routing_healthy(&self) -> bool {
@@ -175,6 +320,7 @@ impl Pool {
         pinned: Option<usize>,
         tried: &[usize],
     ) -> Option<Lease> {
+        let entries = self.accounts.read().unwrap();
         let mut state = self.state.lock().unwrap();
         if !state.routing.healthy() {
             return None;
@@ -188,7 +334,7 @@ impl Pool {
             .iter()
             .enumerate()
             .filter_map(|(idx, account)| {
-                let config = &self.config.accounts[idx];
+                let config = &entries[idx].account;
                 let relevant = |key: &str| {
                     key == "codex-primary"
                         || key == "codex-secondary"
@@ -229,19 +375,15 @@ impl Pool {
         let affinity = session
             .as_deref()
             .and_then(|key| state.routing.get(RouteKind::Session, key))
-            .and_then(|binding| {
-                self.bindings
-                    .iter()
-                    .position(|candidate| candidate == binding)
-            })
+            .and_then(|binding| entries.iter().position(|e| e.binding == binding))
             .filter(|idx| candidates.contains(idx));
         let priority = candidates
             .iter()
-            .map(|&idx| self.config.accounts[idx].priority)
+            .map(|&idx| entries[idx].account.priority)
             .min()?;
         let candidates: Vec<_> = candidates
             .into_iter()
-            .filter(|&idx| self.config.accounts[idx].priority == priority)
+            .filter(|&idx| entries[idx].account.priority == priority)
             .collect();
         let idx = affinity.or_else(|| {
             candidates.into_iter().min_by_key(|&idx| {
@@ -259,7 +401,7 @@ impl Pool {
         if let Some(key) = session
             && state
                 .routing
-                .remember(RouteKind::Session, key, self.bindings[idx].clone())
+                .remember(RouteKind::Session, key, entries[idx].binding.clone())
                 .is_err()
         {
             return None;
@@ -310,10 +452,11 @@ impl Pool {
         if model.is_empty() {
             return false;
         }
+        let entries = self.accounts.read().unwrap();
         let state = self.state.lock().unwrap();
         let at = now();
         let mut matched = false;
-        for (idx, account) in self.config.accounts.iter().enumerate() {
+        for (idx, account) in entries.iter().map(|e| &e.account).enumerate() {
             if pinned.is_some_and(|pin| pin != idx)
                 || !match group {
                     Some(g) => account.groups.iter().any(|name| name == g),
@@ -360,6 +503,7 @@ impl Pool {
         response: Option<&Value>,
         model: &str,
     ) {
+        let entries = self.accounts.read().unwrap();
         let mut state = self.state.lock().unwrap();
         let at = now();
         if let Some(id) = response.and_then(|r| r.get("id")).and_then(Value::as_str) {
@@ -368,9 +512,10 @@ impl Pool {
             let _ = state.routing.remember(
                 RouteKind::Response,
                 affinity::hash(id.as_bytes()),
-                self.bindings[idx].clone(),
+                entries[idx].binding.clone(),
             );
         }
+        drop(entries);
         let account = &mut state.accounts[idx];
         account.requests += 1;
         if status >= 400 || outcome != "complete" {

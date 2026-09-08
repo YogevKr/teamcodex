@@ -178,18 +178,16 @@ async fn load(account: &Account, refresh: bool, rejected_token: Option<&str>) ->
 pub async fn refresh_loop(pool: std::sync::Arc<crate::pool::Pool>) {
     loop {
         let jobs = pool
-            .config
-            .accounts
-            .iter()
-            .enumerate()
-            .filter(|(idx, account)| {
+            .entries()
+            .into_iter()
+            .filter(|(idx, account, _)| {
                 matches!(account.credential, Credential::Managed { .. })
                     && !pool.state.lock().unwrap().accounts[*idx].disabled
             })
-            .map(|(idx, account)| {
+            .map(|(idx, account, auth)| {
                 let pool = &pool;
                 async move {
-                    let failed = pool.auth[idx].get(account, None).await.is_err();
+                    let failed = auth.get(&account, None).await.is_err();
                     let mut state = pool.state.lock().unwrap();
                     if failed {
                         state.accounts[idx].last_error = Some("login_or_refresh_required".into());

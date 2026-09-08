@@ -17,9 +17,46 @@ pub async fn login(path: &Path, name: Option<&str>, no_browser: bool) -> Result<
     }
     let tokens = oauth::browser_login(no_browser).await?;
     let name = register(path, name, tokens).await?;
-    println!("Account {name} saved. Run tcx server to start the pool.");
-    println!("If the server is running, restart it to load account list changes.");
+    match notify_server(&Config::load(path)?).await {
+        Ok(Some(summary)) => {
+            println!("Account {name} saved and loaded into the running pool.");
+            if summary["restart_required"] == true {
+                println!("Settings other than accounts changed; restart the server to apply them.");
+            }
+        }
+        Ok(None) => println!("Account {name} saved. Run tcx server to start the pool."),
+        Err(error) => {
+            println!("Account {name} saved. The running server did not load it: {error}");
+            println!("Run tcx reload, or restart the server.");
+        }
+    }
     Ok(())
+}
+
+/// Ask a running server to apply the configuration file. `None` means no server listens.
+pub async fn notify_server(config: &Config) -> Result<Option<serde_json::Value>> {
+    let client = reqwest::Client::builder().no_proxy().build()?;
+    let response = match client
+        .post(format!("http://{}/reload", config.listen))
+        .bearer_auth(config.client_token()?)
+        .timeout(std::time::Duration::from_secs(10))
+        .send()
+        .await
+    {
+        Ok(response) => response,
+        Err(error) if error.is_connect() => return Ok(None),
+        Err(error) => return Err(error).context("cannot reach the proxy"),
+    };
+    let status = response.status();
+    let value: serde_json::Value = response.json().await.context("invalid proxy response")?;
+    ensure!(
+        status.is_success(),
+        "{}",
+        value["error"]["message"]
+            .as_str()
+            .unwrap_or("reload rejected")
+    );
+    Ok(Some(value))
 }
 
 pub async fn register(

@@ -44,6 +44,7 @@ tcx
 The installed command is `tcx`. Install Codex CLI separately to use `tcx run`.
 Repeat `tcx login --name another-account` for each account you want to add.
 Select the intended account in the browser. Login does not change your existing Codex login.
+A running server takes the new account at once: login asks it to reload, and the server also applies the configuration file within two seconds of any change.
 In another terminal, launch Codex through the running pool:
 
 ```sh
@@ -252,11 +253,17 @@ tcx --config config.json server --headless
 tcx --config config.json status
 tcx --config config.json account personal disable
 tcx --config config.json account personal enable
+tcx --config config.json reload
 tcx --config config.json codex-config
 tcx --config config.json run --group reserved -- exec "Run the tests"
 ```
 
 Account controls change runtime state. Update the configuration to preserve a disabled state across restarts.
+
+`reload` applies the configuration file's account list to the running server. The server also watches the file and reloads two seconds after a change.
+New accounts join the pool. Changed accounts update in place; a changed identity or credential source resets that account's credential cache, quota, and routing binding.
+Accounts removed from the file are disabled and keep their status row until restart. Settings other than `accounts` apply on the next start; the reload result reports `restart_required`.
+Usage counters, holds, and runtime account controls survive a reload.
 In the terminal display, use `j` and `k` to select an account.
 Use Space to change its state. Use `q` to stop the server.
 
@@ -274,6 +281,7 @@ All routes require `Authorization: Bearer <local proxy token>`.
 | GET | `/health` | Server status and version. |
 | GET | `/status` | Account quota, usage, errors, and recent outcomes. |
 | POST | `/accounts/{name}/enabled` | Change account state with `{"enabled": true}`. |
+| POST | `/reload` | Apply the configuration file; returns `added`, `updated`, `removed`, `restart_required`. |
 | POST | `/v1/responses` | Forward a Responses API request. |
 | POST | `/v1/responses/compact` | Forward a compaction request. |
 | GET | `/v1/models` | Forward the model list request. |

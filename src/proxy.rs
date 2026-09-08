@@ -97,6 +97,16 @@ async fn handle(State(app): State<App>, request: Request) -> Response {
     if path == "/status" && parts.method == Method::GET {
         return Json(app.pool.snapshot()).into_response();
     }
+    if path == "/reload" && parts.method == Method::POST {
+        return match app.pool.reload_from_disk() {
+            Ok(summary) => Json(summary).into_response(),
+            Err(failure) => error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "reload_failed",
+                &failure.to_string(),
+            ),
+        };
+    }
     if let Some(name) = path
         .strip_prefix("/accounts/")
         .and_then(|p| p.strip_suffix("/enabled"))
@@ -227,8 +237,11 @@ async fn handle(State(app): State<App>, request: Request) -> Response {
     while let Some(lease) = app.pool.select(model, group, session, pinned, &tried) {
         let idx = lease.idx;
         tried.push(idx);
-        let account = &app.pool.config.accounts[idx];
-        let token = match app.pool.auth[idx].get(account, None).await {
+        let Some((account, auth)) = app.pool.entry(idx) else {
+            continue;
+        };
+        let account = &account;
+        let token = match auth.get(account, None).await {
             Ok(token) => token,
             Err(_) => {
                 auth_failure = true;
@@ -242,10 +255,7 @@ async fn handle(State(app): State<App>, request: Request) -> Response {
             .as_ref()
             .is_ok_and(|r| r.status() == StatusCode::UNAUTHORIZED)
         {
-            match app.pool.auth[idx]
-                .get(account, Some(token.generation))
-                .await
-            {
+            match auth.get(account, Some(token.generation)).await {
                 Ok(token) => {
                     result = send(&app.pool, account.base(), endpoint, &parts, &bytes, &token).await
                 }
@@ -423,7 +433,7 @@ fn send_failure(
     eprintln!(
         "{}",
         json!({
-            "at": now(), "account": pool.config.accounts[idx].name,
+            "at": now(), "account": pool.account(idx).map(|a| a.name),
             "status": 502, "outcome": "upstream_outcome_unknown", "reason": reason,
             "io_kind": io_kind, "elapsed_ms": elapsed_ms,
             "timeout_seconds": timeout_seconds, "replayed": false,
@@ -672,16 +682,15 @@ async fn read_bounded(
 
 pub async fn probe_once(pool: &Arc<Pool>) {
     let jobs = pool
-        .config
-        .accounts
-        .iter()
-        .enumerate()
-        .filter(|(idx, account)| {
+        .entries()
+        .into_iter()
+        .filter(|(idx, account, _)| {
             account.usage().is_some() && !pool.state.lock().unwrap().accounts[*idx].disabled
         })
-        .map(|(idx, account)| async move {
+        .map(|(idx, account, auth)| async move {
+            let account = &account;
             let result = async {
-                let token = pool.auth[idx].get(account, None).await?;
+                let token = auth.get(account, None).await?;
                 let get = |token: Token| {
                     let mut request = pool
                         .client
@@ -695,8 +704,7 @@ pub async fn probe_once(pool: &Arc<Pool>) {
                 };
                 let mut response = get(token.clone()).await?;
                 if response.status() == StatusCode::UNAUTHORIZED {
-                    response =
-                        get(pool.auth[idx].get(account, Some(token.generation)).await?).await?;
+                    response = get(auth.get(account, Some(token.generation)).await?).await?;
                 }
                 anyhow::ensure!(response.status().is_success(), "probe rejected");
                 let bytes = read_bounded(response, 1024 * 1024, 15).await?;
@@ -719,5 +727,42 @@ pub async fn probe_loop(pool: Arc<Pool>) {
     loop {
         probe_once(&pool).await;
         tokio::time::sleep(Duration::from_secs(pool.config.probe_interval_seconds)).await;
+    }
+}
+
+fn modified(path: &std::path::Path) -> Option<std::time::SystemTime> {
+    std::fs::metadata(path).ok().and_then(|m| m.modified().ok())
+}
+
+/// Apply the configuration file to the pool each time its modification time changes.
+/// `tcx login` and manual edits replace the file atomically, so a change is complete when seen.
+pub async fn reload_loop(pool: Arc<Pool>, interval: Duration) {
+    let Some(path) = pool.config_path() else {
+        return;
+    };
+    let mut last = modified(&path);
+    loop {
+        tokio::time::sleep(interval).await;
+        let current = modified(&path);
+        if current == last {
+            continue;
+        }
+        last = current;
+        if current.is_none() {
+            continue;
+        }
+        match pool.reload_from_disk() {
+            Ok(summary) => eprintln!(
+                "{}",
+                json!({"at": now(), "event": "config_reloaded", "added": summary.added,
+                    "updated": summary.updated, "removed": summary.removed,
+                    "restart_required": summary.restart_required})
+            ),
+            // The message names a fixed category; Config::load emits no paths or values.
+            Err(error) => eprintln!(
+                "{}",
+                json!({"at": now(), "event": "config_reload_failed", "reason": error.to_string()})
+            ),
+        }
     }
 }

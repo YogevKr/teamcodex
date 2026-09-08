@@ -48,6 +48,8 @@ enum Commands {
         #[arg(value_parser = ["enable", "disable"])]
         action: String,
     },
+    /// Apply the configuration file's account list to the running server.
+    Reload,
     /// Print a Codex provider configuration without changing existing files.
     CodexConfig,
     /// Run Codex through the proxy, or directly when the proxy is stopped.
@@ -93,6 +95,7 @@ async fn main() -> Result<()> {
                 .context("cannot bind proxy address")?;
             let pool =
                 Pool::persistent(config, &path.with_extension("state").join("routing.jsonl"))?;
+            pool.set_config_path(path.clone());
             let app = proxy::router(pool.clone(), token);
             let (stop, mut receiver) = tokio::sync::watch::channel(false);
             let signal_stop = stop.clone();
@@ -115,6 +118,10 @@ async fn main() -> Result<()> {
             });
             let probe = tokio::spawn(proxy::probe_loop(pool.clone()));
             let refresh = tokio::spawn(auth::refresh_loop(pool.clone()));
+            let reload = tokio::spawn(proxy::reload_loop(
+                pool.clone(),
+                std::time::Duration::from_secs(2),
+            ));
             let ui = if !headless && std::io::stdout().is_terminal() {
                 let ui_stop = stop.clone();
                 Some(tokio::task::spawn_blocking(move || {
@@ -138,13 +145,14 @@ async fn main() -> Result<()> {
             let _ = stop.send(true);
             probe.abort();
             refresh.abort();
+            reload.abort();
             signal.abort();
             if let Some(ui) = ui {
                 ui.await??;
             }
             result?;
         }
-        action @ (Commands::Status | Commands::Account { .. }) => {
+        action @ (Commands::Status | Commands::Account { .. } | Commands::Reload) => {
             let client = reqwest::Client::builder().no_proxy().build()?;
             let url = format!("http://{}", config.listen);
             let request = match &action {
@@ -157,6 +165,7 @@ async fn main() -> Result<()> {
                         .post(format!("{url}/accounts/{name}/enabled"))
                         .json(&serde_json::json!({"enabled":action == "enable"}))
                 }
+                Commands::Reload => client.post(format!("{url}/reload")),
                 _ => client.get(format!("{url}/status")),
             };
             let value: serde_json::Value = request

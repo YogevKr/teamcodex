@@ -15,12 +15,12 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 use teamcodex::{
     config::{Account, Config, Credential, Kind},
     now,
-    pool::Pool,
+    pool::{Pool, Reload},
     proxy,
     quota::Window,
 };
@@ -1258,4 +1258,120 @@ async fn established_affinity_survives_priority_recovery_and_restart_with_reorde
             .idx,
         1
     );
+}
+
+fn extra_account(cfg: &Config, name: &str) -> Account {
+    let mut account = cfg.accounts[0].clone();
+    account.name = name.into();
+    if let Credential::Command { argv, .. } = &mut account.credential {
+        for arg in argv.iter_mut() {
+            *arg = arg.replace("test-upstream-a", &format!("test-upstream-{name}"));
+        }
+    }
+    account
+}
+
+#[tokio::test]
+async fn reload_adds_updates_and_disables_accounts_without_restart() {
+    let mock = mock(|token, _, _| Json(completed(token)).into_response());
+    let source = upstream(&mock).await;
+    let cfg = config(&source.url);
+    let (pool, server) = gateway(cfg.clone()).await;
+    let mut next = cfg.clone();
+    next.accounts[0].priority = 5;
+    next.accounts.remove(1);
+    next.accounts.push(extra_account(&cfg, "c"));
+    assert_eq!(
+        pool.reload(next.clone()).unwrap(),
+        Reload {
+            added: vec!["c".into()],
+            updated: vec!["a".into()],
+            removed: vec!["b".into()],
+            restart_required: false,
+        }
+    );
+    let response = post(&server)
+        .json(&json!({"model":"test"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let body: Value = response.json().await.unwrap();
+    assert!(body["id"].as_str().unwrap().ends_with("test-upstream-c"));
+    let snapshot = pool.snapshot();
+    assert_eq!(snapshot.accounts.len(), 3);
+    assert!(snapshot.accounts[1].disabled);
+    assert_eq!(
+        snapshot.accounts[1].last_error.as_deref(),
+        Some("removed_from_config")
+    );
+    assert_eq!(snapshot.accounts[2].requests, 1);
+    assert_eq!(pool.reload(next).unwrap(), Reload::default());
+    let summary = pool.reload(cfg.clone()).unwrap();
+    assert_eq!(summary.updated, vec!["a".to_string(), "b".to_string()]);
+    assert_eq!(summary.removed, vec!["c".to_string()]);
+    let snapshot = pool.snapshot();
+    assert!(!snapshot.accounts[1].disabled);
+    assert!(snapshot.accounts[1].last_error.is_none());
+    assert!(snapshot.accounts[2].disabled);
+    let mut restarted_settings = cfg;
+    restarted_settings.threshold_percent = 50.0;
+    assert_eq!(
+        pool.reload(restarted_settings).unwrap(),
+        Reload {
+            restart_required: true,
+            ..Default::default()
+        }
+    );
+    assert_eq!(mock.calls.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn reload_endpoint_and_watcher_apply_the_configuration_file() {
+    let mock = mock(|_, _, _| Json(completed("resp_test")).into_response());
+    let source = upstream(&mock).await;
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("config.json");
+    let cfg = config(&source.url);
+    cfg.save(&path).unwrap();
+    let pool = Pool::new(cfg.clone()).unwrap();
+    let server = serve(proxy::router(pool.clone(), CLIENT_TOKEN.into())).await;
+    let client = reqwest::Client::new();
+    let reload = || {
+        client
+            .post(format!("{}/reload", server.url))
+            .bearer_auth(CLIENT_TOKEN)
+            .send()
+    };
+    let response = reload().await.unwrap();
+    assert_eq!(response.status(), 503);
+    assert!(pool.set_config_path(path.clone()));
+    assert!(!pool.set_config_path(path.clone()));
+    let mut next = cfg.clone();
+    next.accounts.push(extra_account(&cfg, "c"));
+    next.save(&path).unwrap();
+    let response = reload().await.unwrap();
+    assert_eq!(response.status(), 200);
+    let body: Value = response.json().await.unwrap();
+    assert_eq!(body["added"], json!(["c"]));
+    assert_eq!(body["restart_required"], false);
+    assert_eq!(pool.len(), 3);
+    std::fs::write(&path, b"{").unwrap();
+    let response = reload().await.unwrap();
+    assert_eq!(response.status(), 503);
+    let body: Value = response.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "reload_failed");
+    assert_eq!(pool.len(), 3);
+    let watcher = tokio::spawn(proxy::reload_loop(pool.clone(), Duration::from_millis(50)));
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    next.accounts.push(extra_account(&cfg, "d"));
+    next.save(&path).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while pool.len() < 4 && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    watcher.abort();
+    assert_eq!(pool.len(), 4);
+    assert_eq!(pool.account(3).unwrap().name, "d");
+    assert!(mock.calls.lock().unwrap().is_empty());
 }

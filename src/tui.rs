@@ -116,9 +116,11 @@ fn run_inner(
 ) -> anyhow::Result<()> {
     let mut selected = 0;
     while !*stop.borrow() {
+        // Accounts can be appended by a configuration reload; the list never shrinks.
+        selected = selected.min(pool.len().saturating_sub(1));
         terminal.draw(|frame| {
             draw(frame, pool);
-            let name = &pool.config.accounts[selected].name;
+            let name = pool.account(selected).map(|a| a.name).unwrap_or_default();
             let area = frame.area();
             if area.height > 0 {
                 frame.render_widget(
@@ -138,13 +140,12 @@ fn run_inner(
                     let _ = stop.send(true);
                     break;
                 }
-                KeyCode::Char('j') | KeyCode::Down => {
-                    selected = (selected + 1) % pool.config.accounts.len()
-                }
+                KeyCode::Char('j') | KeyCode::Down => selected = (selected + 1) % pool.len().max(1),
                 KeyCode::Char('k') | KeyCode::Up => selected = selected.saturating_sub(1),
                 KeyCode::Char(' ') => {
-                    let disabled = pool.snapshot().accounts[selected].disabled;
-                    pool.set_enabled(&pool.config.accounts[selected].name, disabled);
+                    if let Some(account) = pool.snapshot().accounts.get(selected) {
+                        pool.set_enabled(&account.name, account.disabled);
+                    }
                 }
                 _ => {}
             }
