@@ -11,7 +11,10 @@ use futures_util::StreamExt;
 use serde_json::{Value, json};
 use std::{
     collections::HashMap,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::Duration,
 };
 use teamcodex::{
@@ -114,6 +117,126 @@ fn post(server: &Server) -> reqwest::RequestBuilder {
     reqwest::Client::new()
         .post(format!("{}/v1/responses", server.url))
         .bearer_auth(CLIENT_TOKEN)
+}
+
+async fn assert_send_failure(pool: &Pool, response: reqwest::Response, reason: &str) {
+    assert_eq!(response.status(), 502);
+    let body = response.text().await.unwrap();
+    let value: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(value["error"]["code"], "upstream_outcome_unknown");
+    let message = value["error"]["message"].as_str().unwrap();
+    assert!(message.contains(reason), "{message}");
+    assert!(message.contains("Elapsed:"));
+    assert!(message.contains("timeout:"));
+    assert!(message.contains("request was not replayed"));
+    for private in [
+        CLIENT_TOKEN,
+        "test-upstream-a",
+        "test-upstream-b",
+        "private-query",
+        "private-prompt",
+    ] {
+        assert!(!body.contains(private));
+    }
+    let snapshot = pool.snapshot();
+    assert_eq!(snapshot.recent.len(), 1);
+    assert_eq!(snapshot.recent[0].status, 502);
+    assert_eq!(snapshot.recent[0].outcome, reason);
+    assert_eq!(snapshot.accounts[0].last_error.as_deref(), Some(reason));
+    assert_eq!(snapshot.accounts[0].errors, 1);
+    assert_eq!(snapshot.accounts[1].requests, 0);
+    assert!(
+        snapshot
+            .accounts
+            .iter()
+            .all(|account| account.in_flight == 0)
+    );
+}
+
+#[tokio::test]
+async fn response_header_timeout_reports_reason_without_replay() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let source = serve(Router::new().fallback(any({
+        let calls = calls.clone();
+        move || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            std::future::pending::<Response>()
+        }
+    })))
+    .await;
+    let mut cfg = config(&source.url);
+    cfg.idle_timeout_seconds = 1;
+    let (pool, server) = gateway(cfg).await;
+    let response = post(&server)
+        .query(&[("redaction", "private-query")])
+        .json(&json!({"model":"test", "input":"private-prompt"}))
+        .timeout(Duration::from_secs(5))
+        .send()
+        .await
+        .unwrap();
+    assert_send_failure(&pool, response, "upstream_response_header_timeout").await;
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn transport_failure_reports_reason_without_replay() {
+    use tokio::io::AsyncReadExt;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let source = Server {
+        url: format!("http://{}", listener.local_addr().unwrap()),
+        task: tokio::spawn({
+            let calls = calls.clone();
+            async move {
+                loop {
+                    let (mut stream, _) = listener.accept().await.unwrap();
+                    let mut buffer = [0; 4096];
+                    assert!(stream.read(&mut buffer).await.unwrap() > 0);
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    // Close after receiving request bytes, before any response headers.
+                }
+            }
+        }),
+    };
+    let (pool, server) = gateway(config(&source.url)).await;
+    let response = post(&server)
+        .query(&[("redaction", "private-query")])
+        .json(&json!({"model":"test", "input":"private-prompt"}))
+        .timeout(Duration::from_secs(5))
+        .send()
+        .await
+        .unwrap();
+    assert_send_failure(&pool, response, "upstream_transport_error").await;
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn connection_failure_still_selects_another_account() {
+    let mock = mock(|_, _, _| Json(completed("resp_connected")).into_response());
+    let source = upstream(&mock).await;
+    let unavailable = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut cfg = config(&source.url);
+    cfg.accounts[0].base_url = Some(format!("http://{}", unavailable.local_addr().unwrap()));
+    drop(unavailable);
+    let (pool, server) = gateway(cfg).await;
+    let response = post(&server)
+        .json(&json!({"model":"test"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    assert_eq!(
+        response.json::<Value>().await.unwrap()["id"],
+        "resp_connected"
+    );
+    let calls = mock.calls.lock().unwrap();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].0["authorization"], "Bearer test-upstream-b");
+    assert_eq!(
+        pool.snapshot().accounts[0].last_error.as_deref(),
+        Some("connect_failed")
+    );
 }
 
 fn completed(id: &str) -> Value {

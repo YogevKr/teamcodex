@@ -293,6 +293,9 @@ Browser requests with an `Origin` header receive 403.
 - An explicit model rejection with HTTP 400, 403, or 404 restricts that account and model, then selects another account.
 - A connection failure can select another account before the request reaches the upstream.
 - A timeout after connection has an unknown outcome. The proxy returns 502 without replay.
+- A failed request before response headers keeps the `upstream_outcome_unknown` error code. Its message includes the failure category, I/O category when available, elapsed milliseconds, and configured timeout.
+- Status records the failure category, such as `upstream_response_header_timeout` or `upstream_transport_error`. The server also writes a JSON error record to stderr with the account and timestamp. This record survives the 100-entry recent-status window when stderr is retained.
+- Error records exclude raw error text, URLs, headers, credentials, and request bodies. A transport failure does not prove whether the upstream processed the request.
 - Other upstream errors pass through once.
 - Stream errors never trigger request replay after streaming starts.
 - A stream rate-limit error puts the account on hold for later requests.

@@ -15,7 +15,10 @@ use axum::{
 use bytes::Bytes;
 use futures_util::StreamExt;
 use serde_json::{Value, json};
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 const MAX_BODY: usize = 16 * 1024 * 1024;
 
@@ -218,6 +221,7 @@ async fn handle(State(app): State<App>, request: Request) -> Response {
                 continue;
             }
         };
+        let started = Instant::now();
         let mut result = send(&app.pool, account.base(), endpoint, &parts, &bytes, &token).await;
         if result
             .as_ref()
@@ -244,13 +248,8 @@ async fn handle(State(app): State<App>, request: Request) -> Response {
                 app.pool.hold(idx, now() + 5, "connect_failed");
                 continue;
             }
-            Err(SendError::Unknown) => {
-                app.pool.record(idx, 502, "upstream_outcome_unknown", None);
-                return error(
-                    StatusCode::BAD_GATEWAY,
-                    "upstream_outcome_unknown",
-                    "Upstream outcome is unknown; request was not replayed",
-                );
+            Err(SendError::Unknown { reason, io_kind }) => {
+                return send_failure(&app.pool, idx, reason, io_kind, started.elapsed());
             }
         };
         let status = upstream.status();
@@ -366,7 +365,69 @@ fn routing_error() -> Response {
 
 enum SendError {
     Connect,
-    Unknown,
+    Unknown {
+        reason: &'static str,
+        io_kind: Option<std::io::ErrorKind>,
+    },
+}
+
+fn classify_send_error(error: reqwest::Error) -> SendError {
+    if error.is_connect() {
+        return SendError::Connect;
+    }
+    let reason = if error.is_timeout() {
+        "upstream_request_timeout"
+    } else if error.is_builder() {
+        "upstream_request_invalid"
+    } else if error.is_body() {
+        "upstream_request_body_error"
+    } else {
+        "upstream_transport_error"
+    };
+    let mut source = std::error::Error::source(&error);
+    let mut io_kind = None;
+    while let Some(cause) = source {
+        if let Some(error) = cause.downcast_ref::<std::io::Error>() {
+            io_kind = Some(error.kind());
+            break;
+        }
+        source = cause.source();
+    }
+    SendError::Unknown { reason, io_kind }
+}
+
+fn send_failure(
+    pool: &Pool,
+    idx: usize,
+    reason: &str,
+    io_kind: Option<std::io::ErrorKind>,
+    elapsed: Duration,
+) -> Response {
+    let elapsed_ms = elapsed.as_millis();
+    let timeout_seconds = pool.config.idle_timeout_seconds;
+    let io_kind = io_kind.map(|kind| format!("{kind:?}"));
+    pool.record(idx, 502, reason, None);
+    // Error text and its source chain can contain URLs, credentials, or request data.
+    // Emit only fixed categories and numeric timing data, never their Display/Debug text.
+    eprintln!(
+        "{}",
+        json!({
+            "at": now(), "account": pool.config.accounts[idx].name,
+            "status": 502, "outcome": "upstream_outcome_unknown", "reason": reason,
+            "io_kind": io_kind, "elapsed_ms": elapsed_ms,
+            "timeout_seconds": timeout_seconds, "replayed": false,
+        })
+    );
+    error(
+        StatusCode::BAD_GATEWAY,
+        "upstream_outcome_unknown",
+        &format!(
+            "Upstream request failed before response headers: {reason}; I/O: {}. \
+             Elapsed: {elapsed_ms} ms; timeout: {timeout_seconds} s. \
+             Upstream outcome is unknown; request was not replayed",
+            io_kind.as_deref().unwrap_or("unavailable"),
+        ),
+    )
 }
 
 async fn send(
@@ -378,7 +439,10 @@ async fn send(
     token: &Token,
 ) -> Result<reqwest::Response, SendError> {
     let mut url =
-        reqwest::Url::parse(&format!("{base}{endpoint}")).map_err(|_| SendError::Unknown)?;
+        reqwest::Url::parse(&format!("{base}{endpoint}")).map_err(|_| SendError::Unknown {
+            reason: "upstream_url_invalid",
+            io_kind: None,
+        })?;
     url.set_query(parts.uri.query());
     let mut headers = HeaderMap::new();
     // Only protocol headers pass. Client credentials and cookies never pass.
@@ -406,7 +470,10 @@ async fn send(
     if let Some(id) = &token.account_id {
         headers.insert(
             "chatgpt-account-id",
-            HeaderValue::from_str(id).map_err(|_| SendError::Unknown)?,
+            HeaderValue::from_str(id).map_err(|_| SendError::Unknown {
+                reason: "upstream_account_header_invalid",
+                io_kind: None,
+            })?,
         );
     }
     let request = pool
@@ -423,8 +490,11 @@ async fn send(
     .await
     {
         Ok(Ok(response)) => Ok(response),
-        Ok(Err(error)) if error.is_connect() => Err(SendError::Connect),
-        _ => Err(SendError::Unknown),
+        Ok(Err(error)) => Err(classify_send_error(error)),
+        Err(_) => Err(SendError::Unknown {
+            reason: "upstream_response_header_timeout",
+            io_kind: None,
+        }),
     }
 }
 
