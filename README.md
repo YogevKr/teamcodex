@@ -303,7 +303,7 @@ These rules describe proxy attempts. Codex controls client retries and can submi
 - A second 401 puts that account on hold and selects another eligible account.
 - A 429 response records `Retry-After` and selects another eligible account.
 - An explicit model rejection with HTTP 400, 403, or 404 restricts that account and model, then selects another account.
-- A connection failure can select another account before the request reaches the upstream.
+- A connection failure never reaches the upstream. The proxy retries the connection on the same account twice, after 200 ms and 600 ms. After the last failure the account holds for one second and the proxy selects another eligible account. This keeps a short outage inside the Codex client retry window.
 - A timeout after connection has an unknown outcome. The proxy returns 502 without replay.
 - A failed request before response headers keeps the `upstream_outcome_unknown` error code. Its message includes the failure category, I/O category when available, elapsed milliseconds, and configured timeout.
 - Status records the failure category, such as `upstream_response_header_timeout` or `upstream_transport_error`. The server also writes a JSON error record to stderr with the account and timestamp. This record survives the 100-entry recent-status window when stderr is retained.

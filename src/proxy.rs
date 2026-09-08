@@ -22,6 +22,14 @@ use std::{
 
 const MAX_BODY: usize = 16 * 1024 * 1024;
 
+/// A connect failure never sends the request, so a retry on the same account
+/// is safe. Codex retries a failed request for about three seconds. The
+/// in-place retries and the connect hold complete inside that window, so a
+/// short outage on the only eligible account recovers without a visible error.
+const CONNECT_RETRY_DELAYS: [Duration; 2] =
+    [Duration::from_millis(200), Duration::from_millis(600)];
+const CONNECT_HOLD_SECONDS: u64 = 1;
+
 #[derive(Clone)]
 struct App {
     pool: Arc<Pool>,
@@ -250,14 +258,24 @@ async fn handle(State(app): State<App>, request: Request) -> Response {
             }
         };
         let started = Instant::now();
-        let mut result = send(&app.pool, account.base(), endpoint, &parts, &bytes, &token).await;
+        let mut result =
+            send_with_connect_retry(&app.pool, account.base(), endpoint, &parts, &bytes, &token)
+                .await;
         if result
             .as_ref()
             .is_ok_and(|r| r.status() == StatusCode::UNAUTHORIZED)
         {
             match auth.get(account, Some(token.generation)).await {
                 Ok(token) => {
-                    result = send(&app.pool, account.base(), endpoint, &parts, &bytes, &token).await
+                    result = send_with_connect_retry(
+                        &app.pool,
+                        account.base(),
+                        endpoint,
+                        &parts,
+                        &bytes,
+                        &token,
+                    )
+                    .await
                 }
                 Err(_) => {
                     auth_failure = true;
@@ -270,7 +288,8 @@ async fn handle(State(app): State<App>, request: Request) -> Response {
             Ok(response) => response,
             Err(SendError::Connect) => {
                 connect_failure = true;
-                app.pool.hold(idx, now() + 5, "connect_failed");
+                app.pool
+                    .hold(idx, now() + CONNECT_HOLD_SECONDS, "connect_failed");
                 continue;
             }
             Err(SendError::Unknown { reason, io_kind }) => {
@@ -449,6 +468,26 @@ fn send_failure(
             io_kind.as_deref().unwrap_or("unavailable"),
         ),
     )
+}
+
+async fn send_with_connect_retry(
+    pool: &Pool,
+    base: &str,
+    endpoint: &str,
+    parts: &axum::http::request::Parts,
+    body: &Bytes,
+    token: &Token,
+) -> Result<reqwest::Response, SendError> {
+    let mut delays = CONNECT_RETRY_DELAYS.iter();
+    loop {
+        match send(pool, base, endpoint, parts, body, token).await {
+            Err(SendError::Connect) => match delays.next() {
+                Some(delay) => tokio::time::sleep(*delay).await,
+                None => return Err(SendError::Connect),
+            },
+            result => return result,
+        }
+    }
 }
 
 async fn send(

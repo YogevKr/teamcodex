@@ -239,6 +239,61 @@ async fn connection_failure_still_selects_another_account() {
     );
 }
 
+#[tokio::test]
+async fn connect_failure_retries_in_place_and_holds_for_one_second() {
+    let mock = mock(|_, _, _| Json(completed("resp_recovered")).into_response());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    drop(listener);
+    let mut cfg = config(&format!("http://{addr}"));
+    cfg.accounts.truncate(1);
+    let (pool, server) = gateway(cfg).await;
+
+    // Nothing listens. Every attempt fails and the only account holds briefly.
+    let started = Instant::now();
+    let response = post(&server)
+        .json(&json!({"model":"test"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 503);
+    assert_eq!(response.headers()["retry-after"], "1");
+    let body = response.json::<Value>().await.unwrap();
+    assert_eq!(body["error"]["code"], "upstream_unavailable");
+    let elapsed = started.elapsed();
+    assert!(elapsed >= Duration::from_millis(800), "{elapsed:?}");
+    let account = pool.snapshot().accounts.remove(0);
+    assert_eq!(account.last_error.as_deref(), Some("connect_failed"));
+    assert_eq!(account.errors, 1);
+    assert!(account.hold_until <= now() + 1, "{}", account.hold_until);
+
+    // The upstream returns during the next request's in-place retries.
+    let app = Router::new()
+        .fallback(any(mock_handler))
+        .with_state(mock.clone());
+    let upstream = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+        axum::serve(listener, app).await.unwrap();
+    });
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    let response = post(&server)
+        .json(&json!({"model":"test"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    assert_eq!(
+        response.json::<Value>().await.unwrap()["id"],
+        "resp_recovered"
+    );
+    assert_eq!(mock.calls.lock().unwrap().len(), 1);
+    let account = pool.snapshot().accounts.remove(0);
+    assert_eq!(account.errors, 1);
+    assert_eq!(account.in_flight, 0);
+    upstream.abort();
+}
+
 fn completed(id: &str) -> Value {
     json!({"id":id,"object":"response","status":"completed","output":[],"usage":{"input_tokens":11,"output_tokens":7,"input_tokens_details":{"cached_tokens":3}}})
 }
