@@ -217,6 +217,9 @@ If every matching account excludes the model, the proxy returns HTTP 404 with co
 Quota exhaustion still returns HTTP 429. The proxy does not substitute a different model.
 That 429 body uses error type `usage_limit_reached` with code `pool_exhausted` and, when known, `resets_at` in Unix seconds.
 Codex reads this type as a final usage-limit error and shows the reset time instead of retrying the bare status.
+`resets_at` is the earliest reset of a quota window that blocks an enabled account. It never comes from a proxy hold.
+When an account with quota left is on a hold, the proxy answers with the hold's cause instead: HTTP 429 `rate_limited` after an upstream rate limit, HTTP 503 `credentials_unavailable` after a credential failure, or HTTP 503 `upstream_unavailable` after a connection failure.
+Each answer carries `retry-after`, so a Codex client retries instead of reporting a usage limit.
 
 Configure model buckets explicitly. The proxy does not guess model names from bucket labels.
 It always applies the default Codex bucket and adds the configured buckets.

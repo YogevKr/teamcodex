@@ -66,6 +66,29 @@ fn pool_exhausted(resets_at: Option<u64>) -> Response {
     (StatusCode::TOO_MANY_REQUESTS, Json(body)).into_response()
 }
 
+/// A held account is waiting out a transient failure. The answer names the
+/// failure and carries `retry-after`, never a usage-limit reset time that the
+/// upstream did not send.
+fn held(reason: &str) -> Response {
+    match reason {
+        "rate_limited" => error(
+            StatusCode::TOO_MANY_REQUESTS,
+            "rate_limited",
+            "Every eligible account is rate limited; retry after the hold",
+        ),
+        "credential_unavailable" | "credential_refresh_failed" | "authentication_failed" => error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "credentials_unavailable",
+            "No eligible account has working credentials",
+        ),
+        _ => error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "upstream_unavailable",
+            "An eligible account is waiting out an upstream failure",
+        ),
+    }
+}
+
 fn authorized(headers: &HeaderMap, expected: &str) -> bool {
     let Some(actual) = headers
         .get("authorization")
@@ -385,8 +408,10 @@ async fn handle(State(app): State<App>, request: Request) -> Response {
             "upstream_unavailable",
             "Cannot connect to an eligible upstream",
         )
+    } else if let Some((_, reason)) = app.pool.active_hold() {
+        held(&reason)
     } else {
-        pool_exhausted(app.pool.reset_at())
+        pool_exhausted(app.pool.quota_reset_at())
     };
     response.headers_mut().insert(
         "retry-after",

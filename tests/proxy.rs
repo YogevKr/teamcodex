@@ -475,6 +475,109 @@ async fn exhausted_quota_reports_codex_usage_limit_with_earliest_reset() {
 }
 
 #[tokio::test]
+async fn held_credentials_report_the_hold_not_a_usage_limit() {
+    let mock = mock(|_, _, _| Json(completed("resp_test")).into_response());
+    let source = upstream(&mock).await;
+    let mut cfg = config(&source.url);
+    cfg.accounts[0].credential = Credential::Command {
+        argv: vec![
+            "python3".into(),
+            "-c".into(),
+            "import sys; sys.exit(1)".into(),
+        ],
+        cache_seconds: 240,
+    };
+    let (pool, server) = gateway(cfg).await;
+    pool.update_quotas(
+        1,
+        BTreeMap::from([(
+            "codex-primary".to_string(),
+            Window {
+                used_percent: 100.0,
+                reset_at: Some(now() + 3600),
+                window_minutes: Some(10080),
+            },
+        )]),
+    );
+    for attempt in 0..2 {
+        let response = post(&server)
+            .json(&json!({"model":"test"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 503, "attempt {attempt}");
+        let retry_after: u64 = response.headers()["retry-after"]
+            .to_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!(
+            (1..=30).contains(&retry_after),
+            "attempt {attempt}: {retry_after}"
+        );
+        let body: Value = response.json().await.unwrap();
+        assert_eq!(
+            body["error"]["code"], "credentials_unavailable",
+            "attempt {attempt}"
+        );
+        assert!(body["error"].get("resets_at").is_none());
+    }
+    assert!(pool.snapshot().accounts[0].hold_until > now());
+    assert!(mock.calls.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn held_rate_limit_reports_transient_429_without_reset_time() {
+    let mock = mock(|_, _, _| {
+        (
+            StatusCode::TOO_MANY_REQUESTS,
+            [("retry-after", "20")],
+            "slow down",
+        )
+            .into_response()
+    });
+    let source = upstream(&mock).await;
+    let (pool, server) = gateway(config(&source.url)).await;
+    pool.update_quotas(
+        1,
+        BTreeMap::from([(
+            "codex-primary".to_string(),
+            Window {
+                used_percent: 100.0,
+                reset_at: Some(now() + 3600),
+                window_minutes: Some(10080),
+            },
+        )]),
+    );
+    for attempt in 0..2 {
+        let response = post(&server)
+            .json(&json!({"model":"test"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 429, "attempt {attempt}");
+        let retry_after: u64 = response.headers()["retry-after"]
+            .to_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!(
+            (15..=20).contains(&retry_after),
+            "attempt {attempt}: {retry_after}"
+        );
+        let body: Value = response.json().await.unwrap();
+        assert_eq!(body["error"]["code"], "rate_limited", "attempt {attempt}");
+        assert_ne!(body["error"]["type"], "usage_limit_reached");
+        assert!(body["error"].get("resets_at").is_none());
+    }
+    assert_eq!(
+        mock.calls.lock().unwrap().len(),
+        1,
+        "the held account is not retried during its hold"
+    );
+}
+
+#[tokio::test]
 async fn session_affinity_and_response_chain_stay_on_account() {
     let mock = mock(|_, _, _| Json(completed("resp_chain")).into_response());
     let source = upstream(&mock).await;

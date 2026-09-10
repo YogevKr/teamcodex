@@ -488,7 +488,9 @@ impl Pool {
 
     pub fn defer(&self, idx: usize, until: u64) {
         let mut state = self.state.lock().unwrap();
-        state.accounts[idx].hold_until = state.accounts[idx].hold_until.max(until);
+        let account = &mut state.accounts[idx];
+        account.hold_until = account.hold_until.max(until);
+        account.last_error = Some("rate_limited".to_owned());
     }
 
     pub fn record(&self, idx: usize, status: u16, outcome: &str, response: Option<&Value>) {
@@ -596,6 +598,51 @@ impl Pool {
                             .filter(|w| w.used(timestamp) >= self.config.threshold_percent)
                             .filter_map(|w| w.reset_at),
                     )
+            })
+            .filter(|at| *at > timestamp)
+            .min()
+    }
+
+    fn limited(&self, account: &AccountState, timestamp: u64) -> bool {
+        account
+            .quotas
+            .values()
+            .any(|w| w.used(timestamp) >= self.config.threshold_percent)
+    }
+
+    /// The earliest active hold on an enabled account that has quota left, with
+    /// the reason that set it. A hold is the proxy waiting out a transient
+    /// failure; it carries no upstream reset time.
+    pub fn active_hold(&self) -> Option<(u64, String)> {
+        let state = self.state.lock().unwrap();
+        let timestamp = now();
+        state
+            .accounts
+            .iter()
+            .filter(|a| !a.disabled && a.hold_until > timestamp && !self.limited(a, timestamp))
+            .map(|a| {
+                (
+                    a.hold_until,
+                    a.last_error.clone().unwrap_or_else(|| "hold".to_owned()),
+                )
+            })
+            .min_by_key(|(until, _)| *until)
+    }
+
+    /// The earliest reset of a quota window that blocks an enabled account.
+    /// This is the only time the pool reports as a usage-limit reset.
+    pub fn quota_reset_at(&self) -> Option<u64> {
+        let state = self.state.lock().unwrap();
+        let timestamp = now();
+        state
+            .accounts
+            .iter()
+            .filter(|a| !a.disabled)
+            .flat_map(|a| {
+                a.quotas
+                    .values()
+                    .filter(|w| w.used(timestamp) >= self.config.threshold_percent)
+                    .filter_map(|w| w.reset_at)
             })
             .filter(|at| *at > timestamp)
             .min()
