@@ -8,6 +8,7 @@ pub mod pool;
 pub mod proxy;
 pub mod quota;
 pub mod sse;
+pub mod status;
 pub mod storage;
 pub mod tui;
 

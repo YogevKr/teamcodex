@@ -26,7 +26,7 @@ It does not copy source from teamclaude-rs or change that project.
 - Account changes after explicit rate limits, rejected credentials, or connection failures.
 - Streaming, tool calls, compaction, and account pinning for `previous_response_id`.
 - Token totals, cached token totals, optional price estimates, and request outcomes.
-- Terminal display, JSON status, and account controls.
+- Terminal display, a status table, JSON status, and account controls.
 - A Codex launcher that leaves existing configuration files intact.
 
 ## Install
@@ -251,12 +251,17 @@ Unknown quota remains unknown until the server reports it.
 ```sh
 tcx --config config.json server --headless
 tcx --config config.json status
+tcx --config config.json status --json
 tcx --config config.json account personal disable
 tcx --config config.json account personal enable
 tcx --config config.json reload
 tcx --config config.json codex-config
 tcx --config config.json run --group reserved -- exec "Run the tests"
 ```
+
+`tcx status` prints one table row per account on a terminal and the raw JSON when piped. `--json` and `--table` force one form.
+The `5H LEFT` and `WEEK LEFT` columns show the unused share of the Codex windows and the countdown to their reset.
+`OTHER LIMITS` lists any other window at or over `threshold_percent`. `NOTE` shows the last error and an active hold.
 
 Account controls change runtime state. Update the configuration to preserve a disabled state across restarts.
 

@@ -6,7 +6,7 @@ use teamcodex::{
     config::{self, Config},
     login,
     pool::Pool,
-    proxy, tui,
+    proxy, status, tui,
 };
 
 #[derive(Parser)]
@@ -40,8 +40,15 @@ enum Commands {
     },
     /// Check configuration without resolving credentials.
     Check,
-    /// Read live account status as JSON.
-    Status,
+    /// Show live account status: a table on a terminal, JSON otherwise.
+    Status {
+        /// Print the raw status JSON.
+        #[arg(long, conflicts_with = "table")]
+        json: bool,
+        /// Print the account table even when stdout is not a terminal.
+        #[arg(long)]
+        table: bool,
+    },
     /// Enable or disable an account until the server restarts.
     Account {
         name: String,
@@ -152,7 +159,7 @@ async fn main() -> Result<()> {
             }
             result?;
         }
-        action @ (Commands::Status | Commands::Account { .. } | Commands::Reload) => {
+        action @ (Commands::Status { .. } | Commands::Account { .. } | Commands::Reload) => {
             let client = reqwest::Client::builder().no_proxy().build()?;
             let url = format!("http://{}", config.listen);
             let request = match &action {
@@ -176,7 +183,20 @@ async fn main() -> Result<()> {
                 .error_for_status()?
                 .json()
                 .await?;
-            println!("{}", serde_json::to_string_pretty(&value)?);
+            let as_table = match &action {
+                Commands::Status { json, table } => {
+                    !*json && (*table || std::io::stdout().is_terminal())
+                }
+                _ => false,
+            };
+            if as_table {
+                print!(
+                    "{}",
+                    status::render(&value, config.threshold_percent, teamcodex::now())
+                );
+            } else {
+                println!("{}", serde_json::to_string_pretty(&value)?);
+            }
         }
         Commands::Run { group, args } => {
             return run_codex(&config, group.as_deref(), args).await;

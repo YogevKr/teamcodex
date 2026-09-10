@@ -1,4 +1,4 @@
-use crate::pool::Pool;
+use crate::{pool::Pool, status};
 use ratatui::{
     DefaultTerminal, Frame,
     crossterm::event::{self, Event, KeyCode, KeyEventKind},
@@ -24,19 +24,13 @@ pub fn draw(frame: &mut Frame, pool: &Pool) {
         layout[0],
     );
     let rows = snapshot.accounts.iter().map(|a| {
-        let status = if a.disabled {
-            "disabled"
-        } else if a.hold_until > snapshot.at {
-            "waiting"
-        } else if a
-            .quotas
-            .values()
-            .any(|w| w.used_percent >= pool.config.threshold_percent)
-        {
-            "limited"
-        } else {
-            "ready"
-        };
+        let status = status::state_label(
+            a.disabled,
+            a.hold_until,
+            &a.quotas,
+            pool.config.threshold_percent,
+            snapshot.at,
+        );
         let quota = if a.quotas.is_empty() {
             "unknown".to_owned()
         } else {
