@@ -86,7 +86,7 @@ fn config(base: &str) -> Config {
                 argv: vec!["python3".into(), "-c".into(), format!("import json; print(json.dumps({{'access_token':'test-upstream-{name}'}}))")],
                 cache_seconds: 240,
             },
-            priority: 0, disabled: false, groups: vec![], models: vec![],
+            priority: 0, disabled: false, groups: vec![], models: vec![], threshold_percent: None,
         }).collect(),
     }
 }
@@ -575,6 +575,58 @@ async fn held_rate_limit_reports_transient_429_without_reset_time() {
         1,
         "the held account is not retried during its hold"
     );
+}
+
+#[tokio::test]
+async fn per_account_threshold_overrides_default_and_survives_reload() {
+    let mock = mock(|_, _, _| Json(completed("resp_test")).into_response());
+    let source = upstream(&mock).await;
+    let mut cfg = config(&source.url);
+    cfg.accounts[1].threshold_percent = Some(100.0);
+    let (pool, server) = gateway(cfg.clone()).await;
+    for idx in 0..2 {
+        pool.update_quotas(
+            idx,
+            BTreeMap::from([(
+                "codex-primary".to_string(),
+                Window {
+                    used_percent: 97.0,
+                    reset_at: Some(now() + 3600),
+                    window_minutes: Some(10080),
+                },
+            )]),
+        );
+    }
+    let response = post(&server)
+        .json(&json!({"model":"test"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let served = {
+        let calls = mock.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        calls[0].0["authorization"].to_str().unwrap().to_owned()
+    };
+    assert_eq!(served, "Bearer test-upstream-b");
+    let snapshot = pool.snapshot();
+    assert_eq!(snapshot.accounts[0].threshold_percent, 95.0);
+    assert_eq!(snapshot.accounts[1].threshold_percent, 100.0);
+
+    cfg.accounts[1].threshold_percent = None;
+    let reload = pool.reload(cfg).unwrap();
+    assert_eq!(reload.updated, vec!["b".to_string()]);
+    assert!(!reload.restart_required);
+    assert_eq!(pool.snapshot().accounts[1].threshold_percent, 95.0);
+    let exhausted = post(&server)
+        .json(&json!({"model":"test"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(exhausted.status(), 429);
+    let body: Value = exhausted.json().await.unwrap();
+    assert_eq!(body["error"]["type"], "usage_limit_reached");
+    assert_eq!(mock.calls.lock().unwrap().len(), 1);
 }
 
 #[tokio::test]

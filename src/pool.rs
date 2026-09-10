@@ -38,6 +38,8 @@ pub struct AccountState {
     pub last_error: Option<String>,
     pub last_probe: Option<u64>,
     pub last_probe_ok: Option<bool>,
+    /// Effective selection threshold: the account override or the default.
+    pub threshold_percent: f64,
     #[serde(skip)]
     pub selected: u64,
 }
@@ -136,6 +138,7 @@ impl Pool {
             .map(|e| AccountState {
                 name: e.account.name.clone(),
                 disabled: e.account.disabled,
+                threshold_percent: e.account.threshold(config.threshold_percent),
                 ..Default::default()
             })
             .collect();
@@ -230,6 +233,7 @@ impl Pool {
                 state.accounts.push(AccountState {
                     name: account.name.clone(),
                     disabled: account.disabled,
+                    threshold_percent: account.threshold(self.config.threshold_percent),
                     ..Default::default()
                 });
                 entries.push(Entry::new(account)?);
@@ -257,6 +261,7 @@ impl Pool {
             if restored {
                 live.last_error = None;
             }
+            live.threshold_percent = account.threshold(self.config.threshold_percent);
             entry.account = account;
             summary.updated.push(entry.account.name.clone());
         }
@@ -349,7 +354,7 @@ impl Pool {
                         })
                 };
                 let limited = account.quotas.iter().any(|(key, w)| {
-                    relevant(key) && w.used(timestamp) >= self.config.threshold_percent
+                    relevant(key) && w.used(timestamp) >= account.threshold_percent
                 });
                 let eligible = !account.disabled
                     && account.hold_until <= timestamp
@@ -595,7 +600,7 @@ impl Pool {
                     .chain(
                         a.quotas
                             .values()
-                            .filter(|w| w.used(timestamp) >= self.config.threshold_percent)
+                            .filter(|w| w.used(timestamp) >= a.threshold_percent)
                             .filter_map(|w| w.reset_at),
                     )
             })
@@ -607,7 +612,7 @@ impl Pool {
         account
             .quotas
             .values()
-            .any(|w| w.used(timestamp) >= self.config.threshold_percent)
+            .any(|w| w.used(timestamp) >= account.threshold_percent)
     }
 
     /// The earliest active hold on an enabled account that has quota left, with
@@ -641,7 +646,7 @@ impl Pool {
             .flat_map(|a| {
                 a.quotas
                     .values()
-                    .filter(|w| w.used(timestamp) >= self.config.threshold_percent)
+                    .filter(|w| w.used(timestamp) >= a.threshold_percent)
                     .filter_map(|w| w.reset_at)
             })
             .filter(|at| *at > timestamp)

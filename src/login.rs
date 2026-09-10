@@ -157,6 +157,7 @@ pub async fn register(
             disabled: false,
             groups: Vec::new(),
             models: Vec::new(),
+            threshold_percent: None,
         });
     }
     if config.client_token_file.is_none() {

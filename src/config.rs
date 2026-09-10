@@ -59,6 +59,9 @@ pub struct Account {
     pub groups: Vec<String>,
     #[serde(default)]
     pub models: Vec<String>,
+    /// Per-account override of the top-level `threshold_percent`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub threshold_percent: Option<f64>,
 }
 
 #[derive(Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
@@ -123,6 +126,11 @@ fn credential_ttl() -> u64 {
 }
 
 impl Account {
+    /// The selection threshold for this account: its override, else the default.
+    pub fn threshold(&self, default: f64) -> f64 {
+        self.threshold_percent.unwrap_or(default)
+    }
+
     pub fn base(&self) -> &str {
         self.base_url
             .as_deref()
@@ -211,6 +219,12 @@ impl Config {
         for a in &self.accounts {
             validate_name(&a.name)?;
             ensure!(names.insert(&a.name), "duplicate account name");
+            if let Some(t) = a.threshold_percent {
+                ensure!(
+                    t.is_finite() && t > 0.0 && t <= 100.0,
+                    "account threshold_percent must be in (0, 100]"
+                );
+            }
             validate_url(a.base())?;
             if let Some(url) = a.usage() {
                 validate_url(url)?;

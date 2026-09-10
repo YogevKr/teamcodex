@@ -28,7 +28,7 @@ pub fn draw(frame: &mut Frame, pool: &Pool) {
             a.disabled,
             a.hold_until,
             &a.quotas,
-            pool.config.threshold_percent,
+            a.threshold_percent,
             snapshot.at,
         );
         let quota = if a.quotas.is_empty() {

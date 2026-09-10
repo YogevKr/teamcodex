@@ -97,7 +97,10 @@ fn other_limits(quotas: &Quotas, threshold: f64, now: u64) -> String {
     }
 }
 
-fn account_row(account: &Value, threshold: f64, now: u64) -> Vec<String> {
+fn account_row(account: &Value, default_threshold: f64, now: u64) -> Vec<String> {
+    let threshold = account["threshold_percent"]
+        .as_f64()
+        .unwrap_or(default_threshold);
     let quotas: Quotas = account
         .get("quotas")
         .cloned()
@@ -120,6 +123,7 @@ fn account_row(account: &Value, threshold: f64, now: u64) -> Vec<String> {
     vec![
         account["name"].as_str().unwrap_or("?").to_owned(),
         state_label(disabled, hold_until, &quotas, threshold, now).to_owned(),
+        format!("{threshold:.0}%"),
         remaining(&quotas, Kind::Short, now),
         remaining(&quotas, Kind::Weekly, now),
         other_limits(&quotas, threshold, now),
@@ -135,9 +139,10 @@ fn account_row(account: &Value, threshold: f64, now: u64) -> Vec<String> {
     ]
 }
 
-const HEADER: [&str; 10] = [
+const HEADER: [&str; 11] = [
     "ACCOUNT",
     "STATE",
+    "LIMIT AT",
     "5H LEFT",
     "WEEK LEFT",
     "OTHER LIMITS",
@@ -219,7 +224,7 @@ mod tests {
                     }
                 },
                 {
-                    "name": "team", "disabled": false, "hold_until": 1023, "in_flight": 0,
+                    "name": "team", "disabled": false, "hold_until": 1023, "in_flight": 0, "threshold_percent": 100.0,
                     "requests": 115, "errors": 746, "last_error": "credential_unavailable", "last_probe_ok": false,
                     "quotas": {
                         "codex-primary": {"used_percent": 0.0, "reset_at": 500, "window_minutes": 300},
@@ -249,6 +254,7 @@ mod tests {
         let text = render(&status(), 95.0, 1000);
         let personal = row(&text, "personal");
         assert!(personal.contains("limited"), "{personal}");
+        assert!(personal.contains("  95%  "), "default column: {personal}");
         assert!(personal.contains("  -  "), "no short window: {personal}");
         assert!(personal.contains("4% (+1d03h)"), "{personal}");
         assert!(personal.contains("  ok  "), "{personal}");
@@ -259,6 +265,7 @@ mod tests {
         let text = render(&status(), 95.0, 1000);
         let team = row(&text, "team");
         assert!(team.contains("waiting"), "{team}");
+        assert!(team.contains("  100%  "), "override column: {team}");
         assert!(
             team.contains("100%"),
             "expired short window reads full: {team}"

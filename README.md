@@ -176,7 +176,7 @@ opagent ./target/release/tcx --config config.json run -- exec "Explain this repo
 | `listen` | Loopback address. Default: `127.0.0.1:4269`. |
 | `client_token_env` | Local proxy token variable. Default: `TEAMCODEX_PROXY_TOKEN`. Optional when a token file is configured. |
 | `client_token_file` | Absolute path to a private local proxy token file. Browser login creates it automatically. |
-| `threshold_percent` | Stop selecting an account at this percentage. Default: `95`. |
+| `threshold_percent` | Stop selecting an account at this percentage. Default: `95`. Each account can override it. |
 | `probe_interval_seconds` | Usage polling interval. Default: `60`. Set `0` to disable polling. |
 | `idle_timeout_seconds` | Upstream response and stream inactivity limit. Default: `300`. |
 | `model_limits` | Map model names to additional quota bucket IDs. |
@@ -195,6 +195,7 @@ Each account has a `name`, `kind`, and `credential`.
 | `disabled` | Initial account state. Default: `false`. |
 | `groups` | Reserved groups. Empty accounts serve requests without a group. |
 | `models` | Exact allowed model names. Empty allows any model not temporarily restricted by an upstream rejection. |
+| `threshold_percent` | Override of the top-level threshold for this account, in `(0, 100]`. A reload applies it without a restart. |
 
 ChatGPT accounts without an endpoint override poll `/backend-api/wham/usage`.
 API accounts use response headers; they do not call the ChatGPT usage endpoint.
@@ -263,6 +264,7 @@ tcx --config config.json run --group reserved -- exec "Run the tests"
 ```
 
 `tcx status` prints one table row per account on a terminal and the raw JSON when piped. `--json` and `--table` force one form.
+`LIMIT AT` is the account's effective threshold. The status JSON carries it as `threshold_percent` on each account.
 The `5H LEFT` and `WEEK LEFT` columns show the unused share of the Codex windows and the countdown to their reset.
 `OTHER LIMITS` lists any other window at or over `threshold_percent`. `NOTE` shows the last error and an active hold.
 
