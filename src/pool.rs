@@ -40,6 +40,15 @@ pub struct AccountState {
     pub last_probe_ok: Option<bool>,
     /// Effective selection threshold: the account override or the default.
     pub threshold_percent: f64,
+    /// Usage-limit reset credits the account can redeem, from the last probe
+    /// or credit listing. `None` until the upstream reports a count.
+    pub reset_credits: Option<i64>,
+    /// Reset credits redeemed through this server.
+    pub resets: u64,
+    /// Unix time of the last redeemed reset.
+    pub last_reset: Option<u64>,
+    /// No automatic redeem before this Unix time.
+    pub reset_retry_at: u64,
     #[serde(skip)]
     pub selected: u64,
 }
@@ -115,6 +124,8 @@ pub struct Pool {
     pub state: Mutex<State>,
     pub client: reqwest::Client,
     config_path: OnceLock<PathBuf>,
+    /// One reset redeem at a time, so concurrent exhausted requests spend one credit.
+    pub reset_lock: tokio::sync::Mutex<()>,
 }
 
 // Lock order: `accounts` (read or write) before `state`. Never hold either across an await.
@@ -158,6 +169,7 @@ impl Pool {
                 recent: VecDeque::new(),
             }),
             config_path: OnceLock::new(),
+            reset_lock: tokio::sync::Mutex::new(()),
         }))
     }
 
@@ -333,45 +345,21 @@ impl Pool {
         let session =
             session.map(|key| affinity::hash(&serde_json::to_vec(&(model, group, key)).unwrap()));
         let timestamp = now();
-        let limits = self.config.model_limits.get(model);
         let candidates: Vec<usize> = state
             .accounts
             .iter()
             .enumerate()
             .filter_map(|(idx, account)| {
-                let config = &entries[idx].account;
-                let relevant = |key: &str| {
-                    key == "codex-primary"
-                        || key == "codex-secondary"
-                        || key == format!("api:{model}:requests")
-                        || key == format!("api:{model}:tokens")
-                        || key == format!("api:{model}:project-tokens")
-                        || limits.is_some_and(|ids| {
-                            ids.iter().any(|id| {
-                                key == format!("{}-primary", quota::normalize(id))
-                                    || key == format!("{}-secondary", quota::normalize(id))
-                            })
-                        })
-                };
-                let limited = account.quotas.iter().any(|(key, w)| {
-                    relevant(key) && w.used(timestamp) >= account.threshold_percent
-                });
-                let eligible = !account.disabled
-                    && account.hold_until <= timestamp
-                    && !limited
-                    && account
-                        .unavailable_models
-                        .get(model)
-                        .is_none_or(|until| *until <= timestamp)
-                    && !tried.contains(&idx)
-                    && pinned.is_none_or(|pin| pin == idx)
-                    && (model.is_empty()
-                        || config.models.is_empty()
-                        || config.models.iter().any(|m| m == model))
-                    && match group {
-                        Some(g) => config.groups.iter().any(|s| s == g),
-                        None => config.groups.is_empty(),
-                    };
+                let eligible = !tried.contains(&idx)
+                    && self.eligible(
+                        &entries[idx].account,
+                        idx,
+                        account,
+                        model,
+                        group,
+                        pinned,
+                        timestamp,
+                    );
                 eligible.then_some(idx)
             })
             .collect();
@@ -425,6 +413,178 @@ impl Pool {
         self.state.lock().unwrap().accounts[idx]
             .quotas
             .extend(quotas);
+    }
+
+    pub fn set_reset_credits(&self, idx: usize, count: Option<i64>) {
+        if let Some(count) = count {
+            self.state.lock().unwrap().accounts[idx].reset_credits = Some(count);
+        }
+    }
+
+    /// Record a redeemed reset. The Codex windows read as empty until the next
+    /// probe or response header reports the real value.
+    pub fn record_reset(&self, idx: usize) {
+        let mut state = self.state.lock().unwrap();
+        let account = &mut state.accounts[idx];
+        account.resets += 1;
+        account.last_reset = Some(now());
+        if let Some(count) = account.reset_credits.as_mut() {
+            *count = (*count - 1).max(0);
+        }
+        for (id, window) in account.quotas.iter_mut() {
+            if matches!(id.as_str(), "codex-primary" | "codex-secondary") {
+                window.used_percent = 0.0;
+            }
+        }
+    }
+
+    /// Block automatic redeems on the account until `until`.
+    pub fn defer_reset(&self, idx: usize, until: u64) {
+        let account = &mut self.state.lock().unwrap().accounts[idx];
+        account.reset_retry_at = account.reset_retry_at.max(until);
+    }
+
+    /// True while an automatic redeem on `idx` still helps: the account opted
+    /// in, is enabled, holds a credit, sits outside its cooldown, and a Codex
+    /// window still blocks it.
+    pub fn auto_reset_ready(&self, idx: usize) -> bool {
+        let entries = self.accounts.read().unwrap();
+        let state = self.state.lock().unwrap();
+        let timestamp = now();
+        let (Some(entry), Some(account)) = (entries.get(idx), state.accounts.get(idx)) else {
+            return false;
+        };
+        entry.account.auto_reset
+            && !account.disabled
+            && account.reset_retry_at <= timestamp
+            && account.reset_credits.is_some_and(|count| count > 0)
+            && self.codex_limited(account, timestamp)
+    }
+
+    /// Index of the account named `name`.
+    pub fn index(&self, name: &str) -> Option<usize> {
+        self.accounts
+            .read()
+            .unwrap()
+            .iter()
+            .position(|e| e.account.name == name)
+    }
+
+    /// True when some enabled account can take a request for `model` now.
+    pub fn has_eligible(&self, model: &str, group: Option<&str>, pinned: Option<usize>) -> bool {
+        let entries = self.accounts.read().unwrap();
+        let state = self.state.lock().unwrap();
+        let timestamp = now();
+        entries.iter().enumerate().any(|(idx, entry)| {
+            self.eligible(
+                &entry.account,
+                idx,
+                &state.accounts[idx],
+                model,
+                group,
+                pinned,
+                timestamp,
+            )
+        })
+    }
+
+    /// Selection rule shared by `select` and `has_eligible`: the account
+    /// matches the request and no relevant quota window, hold, or model
+    /// restriction blocks it.
+    #[allow(clippy::too_many_arguments)]
+    fn eligible(
+        &self,
+        config: &Account,
+        idx: usize,
+        account: &AccountState,
+        model: &str,
+        group: Option<&str>,
+        pinned: Option<usize>,
+        timestamp: u64,
+    ) -> bool {
+        let limits = self.config.model_limits.get(model);
+        let relevant = |key: &str| {
+            key == "codex-primary"
+                || key == "codex-secondary"
+                || key == format!("api:{model}:requests")
+                || key == format!("api:{model}:tokens")
+                || key == format!("api:{model}:project-tokens")
+                || limits.is_some_and(|ids| {
+                    ids.iter().any(|id| {
+                        key == format!("{}-primary", quota::normalize(id))
+                            || key == format!("{}-secondary", quota::normalize(id))
+                    })
+                })
+        };
+        let limited = account
+            .quotas
+            .iter()
+            .any(|(key, w)| relevant(key) && w.used(timestamp) >= account.threshold_percent);
+        !account.disabled
+            && account.hold_until <= timestamp
+            && !limited
+            && account
+                .unavailable_models
+                .get(model)
+                .is_none_or(|until| *until <= timestamp)
+            && self.matches(config, idx, model, group, pinned)
+    }
+
+    /// The limited account that an automatic reset should recover for this
+    /// request: it opted in, matches the request, and holds a credit. The
+    /// cooldown is checked under the reset lock, so a request that arrives
+    /// during a redeem waits for it instead of failing. Ties prefer the
+    /// higher-priority account.
+    pub fn auto_reset_candidate(
+        &self,
+        model: &str,
+        group: Option<&str>,
+        pinned: Option<usize>,
+    ) -> Option<usize> {
+        let entries = self.accounts.read().unwrap();
+        let state = self.state.lock().unwrap();
+        let timestamp = now();
+        entries
+            .iter()
+            .enumerate()
+            .filter(|(idx, entry)| {
+                let account = &state.accounts[*idx];
+                entry.account.auto_reset
+                    && self.matches(&entry.account, *idx, model, group, pinned)
+                    && !account.disabled
+                    && account.hold_until <= timestamp
+                    && account.reset_credits.is_some_and(|count| count > 0)
+                    && self.codex_limited(account, timestamp)
+            })
+            .min_by_key(|(idx, entry)| (entry.account.priority, *idx))
+            .map(|(idx, _)| idx)
+    }
+
+    fn matches(
+        &self,
+        config: &Account,
+        idx: usize,
+        model: &str,
+        group: Option<&str>,
+        pinned: Option<usize>,
+    ) -> bool {
+        pinned.is_none_or(|pin| pin == idx)
+            && (model.is_empty()
+                || config.models.is_empty()
+                || config.models.iter().any(|m| m == model))
+            && match group {
+                Some(g) => config.groups.iter().any(|s| s == g),
+                None => config.groups.is_empty(),
+            }
+    }
+
+    /// A reset credit only clears the Codex windows, so only those decide
+    /// whether a redeem can help.
+    fn codex_limited(&self, account: &AccountState, timestamp: u64) -> bool {
+        account.quotas.iter().any(|(id, w)| {
+            matches!(id.as_str(), "codex-primary" | "codex-secondary")
+                && w.used(timestamp) >= account.threshold_percent
+        })
     }
 
     pub fn mark_model_unavailable(&self, idx: usize, model: &str) {

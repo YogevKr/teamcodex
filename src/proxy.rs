@@ -2,9 +2,10 @@ use crate::{
     auth::Token,
     models, now,
     pool::{Lease, Pool},
-    quota,
+    quota, reset,
     sse::Parser,
 };
+use anyhow::Context;
 use axum::{
     Json, Router,
     body::{Body, to_bytes},
@@ -160,6 +161,71 @@ async fn handle(State(app): State<App>, request: Request) -> Response {
             error(StatusCode::NOT_FOUND, "account", "Unknown account")
         };
     }
+    if let Some(name) = path
+        .strip_prefix("/accounts/")
+        .and_then(|p| p.strip_suffix("/reset-credits"))
+    {
+        if parts.method != Method::GET {
+            return error(StatusCode::METHOD_NOT_ALLOWED, "method", "Use GET");
+        }
+        let Some(idx) = app.pool.index(name) else {
+            return error(StatusCode::NOT_FOUND, "account", "Unknown account");
+        };
+        return match reset::list(&app.pool, idx).await {
+            Ok(value) => Json(value).into_response(),
+            Err(failure) => error(
+                StatusCode::BAD_GATEWAY,
+                "reset_credits_failed",
+                &failure.to_string(),
+            ),
+        };
+    }
+    if let Some(name) = path
+        .strip_prefix("/accounts/")
+        .and_then(|p| p.strip_suffix("/reset"))
+    {
+        if parts.method != Method::POST {
+            return error(StatusCode::METHOD_NOT_ALLOWED, "method", "Use POST");
+        }
+        let Some(idx) = app.pool.index(name) else {
+            return error(StatusCode::NOT_FOUND, "account", "Unknown account");
+        };
+        let Ok(bytes) = to_bytes(body, 4096).await else {
+            return error(StatusCode::BAD_REQUEST, "body", "Invalid control body");
+        };
+        let value = if bytes.is_empty() {
+            json!({})
+        } else {
+            match serde_json::from_slice::<Value>(&bytes) {
+                Ok(value) if value.is_object() => value,
+                _ => return error(StatusCode::BAD_REQUEST, "body", "Expected a JSON object"),
+            }
+        };
+        let field = |key: &str| {
+            value
+                .get(key)
+                .and_then(Value::as_str)
+                .filter(|v| !v.is_empty())
+        };
+        return match reset::redeem(&app.pool, idx, field("credit_id"), field("request_id")).await {
+            Ok(outcome) => {
+                let account = app.pool.snapshot().accounts.into_iter().nth(idx);
+                Json(json!({
+                    "account": name,
+                    "code": outcome.code,
+                    "windows_reset": outcome.windows_reset,
+                    "reset_credits": account.as_ref().and_then(|a| a.reset_credits),
+                    "quotas": account.map(|a| a.quotas).unwrap_or_default(),
+                }))
+                .into_response()
+            }
+            Err(failure) => error(
+                StatusCode::BAD_GATEWAY,
+                "reset_failed",
+                &failure.to_string(),
+            ),
+        };
+    }
     let endpoint = path
         .strip_prefix("/v1")
         .or_else(|| path.strip_prefix("/backend-api/codex"))
@@ -262,6 +328,13 @@ async fn handle(State(app): State<App>, request: Request) -> Response {
         },
         None => None,
     };
+    // An exhausted pool may hold an account that opted into automatic resets.
+    // Redeem before selection, so this request lands on the cleared account.
+    if !app.pool.has_eligible(model, group, pinned)
+        && let Some(idx) = app.pool.auto_reset_candidate(model, group, pinned)
+    {
+        reset::auto(&app.pool, idx).await;
+    }
     let mut tried = Vec::new();
     let mut auth_failure = false;
     let mut connect_failure = false;
@@ -726,7 +799,7 @@ async fn forward(upstream: reqwest::Response, lease: Lease, idle: u64, model: St
     }
 }
 
-async fn read_bounded(
+pub async fn read_bounded(
     response: reqwest::Response,
     maximum: usize,
     idle: u64,
@@ -744,6 +817,43 @@ async fn read_bounded(
     Ok(bytes)
 }
 
+/// Read one account's usage endpoint and record its quota windows and reset
+/// credit count. Accounts without a usage endpoint are skipped as an error.
+pub async fn probe_account(pool: &Arc<Pool>, idx: usize) -> anyhow::Result<()> {
+    let (account, auth) = pool.entry(idx).context("unknown account")?;
+    let account = &account;
+    let usage = account.usage().context("no usage endpoint")?;
+    let result = async {
+        let token = auth.get(account, None).await?;
+        let get = |token: Token| {
+            let mut request = pool
+                .client
+                .get(usage)
+                .bearer_auth(token.access_token)
+                .timeout(Duration::from_secs(15));
+            if let Some(id) = token.account_id {
+                request = request.header("chatgpt-account-id", id);
+            }
+            request.send()
+        };
+        let mut response = get(token.clone()).await?;
+        if response.status() == StatusCode::UNAUTHORIZED {
+            response = get(auth.get(account, Some(token.generation)).await?).await?;
+        }
+        anyhow::ensure!(response.status().is_success(), "probe rejected");
+        let bytes = read_bounded(response, 1024 * 1024, 15).await?;
+        let value: Value = serde_json::from_slice(&bytes)?;
+        pool.update_quotas(idx, quota::usage(&value, now()));
+        pool.set_reset_credits(idx, quota::reset_credits(&value));
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+    let mut state = pool.state.lock().unwrap();
+    state.accounts[idx].last_probe = Some(now());
+    state.accounts[idx].last_probe_ok = Some(result.is_ok());
+    result
+}
+
 pub async fn probe_once(pool: &Arc<Pool>) {
     let jobs = pool
         .entries()
@@ -751,35 +861,8 @@ pub async fn probe_once(pool: &Arc<Pool>) {
         .filter(|(idx, account, _)| {
             account.usage().is_some() && !pool.state.lock().unwrap().accounts[*idx].disabled
         })
-        .map(|(idx, account, auth)| async move {
-            let account = &account;
-            let result = async {
-                let token = auth.get(account, None).await?;
-                let get = |token: Token| {
-                    let mut request = pool
-                        .client
-                        .get(account.usage().unwrap())
-                        .bearer_auth(token.access_token)
-                        .timeout(Duration::from_secs(15));
-                    if let Some(id) = token.account_id {
-                        request = request.header("chatgpt-account-id", id);
-                    }
-                    request.send()
-                };
-                let mut response = get(token.clone()).await?;
-                if response.status() == StatusCode::UNAUTHORIZED {
-                    response = get(auth.get(account, Some(token.generation)).await?).await?;
-                }
-                anyhow::ensure!(response.status().is_success(), "probe rejected");
-                let bytes = read_bounded(response, 1024 * 1024, 15).await?;
-                let value: Value = serde_json::from_slice(&bytes)?;
-                pool.update_quotas(idx, quota::usage(&value, now()));
-                Ok::<(), anyhow::Error>(())
-            }
-            .await;
-            let mut state = pool.state.lock().unwrap();
-            state.accounts[idx].last_probe = Some(now());
-            state.accounts[idx].last_probe_ok = Some(result.is_ok());
+        .map(|(idx, _, _)| async move {
+            let _ = probe_account(pool, idx).await;
         });
     futures_util::future::join_all(jobs).await;
 }

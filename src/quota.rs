@@ -197,6 +197,17 @@ pub fn usage(value: &Value, timestamp: u64) -> Quotas {
     output
 }
 
+/// The number of usage-limit reset credits the account can redeem, when the
+/// usage or credit-list payload reports it.
+pub fn reset_credits(value: &Value) -> Option<i64> {
+    value
+        .get("rate_limit_reset_credits")
+        .unwrap_or(value)
+        .get("available_count")
+        .and_then(Value::as_i64)
+        .map(|count| count.max(0))
+}
+
 pub fn retry_at(headers: &HeaderMap, timestamp: u64) -> u64 {
     let raw = headers.get("retry-after").and_then(|v| v.to_str().ok());
     let seconds = raw

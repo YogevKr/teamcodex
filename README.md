@@ -23,6 +23,7 @@ It does not copy source from teamclaude-rs or change that project.
 - Automatic account selection after an explicit model access rejection.
 - Primary, secondary, and configured model quota windows.
 - Usage polling and quota updates from response headers and stream events.
+- Usage-limit reset credits: a status count, a redeem command, and an opt-in automatic redeem.
 - Account changes after explicit rate limits, rejected credentials, or connection failures.
 - Streaming, tool calls, compaction, and account pinning for `previous_response_id`.
 - Token totals, cached token totals, optional price estimates, and request outcomes.
@@ -196,8 +197,10 @@ Each account has a `name`, `kind`, and `credential`.
 | `groups` | Reserved groups. Empty accounts serve requests without a group. |
 | `models` | Exact allowed model names. Empty allows any model not temporarily restricted by an upstream rejection. |
 | `threshold_percent` | Override of the top-level threshold for this account, in `(0, 100]`. A reload applies it without a restart. |
+| `auto_reset` | Redeem a usage-limit reset credit automatically when this account blocks a request and holds a credit. Default: `false`. |
 
 ChatGPT accounts without an endpoint override poll `/backend-api/wham/usage`.
+The same poll reads the account's usage-limit reset credits. See "Usage-limit reset credits" below.
 API accounts use response headers; they do not call the ChatGPT usage endpoint.
 API request and token limits apply to the model that produced those headers.
 The proxy does not infer shared API model-family limits from these headers.
@@ -259,6 +262,9 @@ tcx --config config.json status --json
 tcx --config config.json account personal disable
 tcx --config config.json account personal enable
 tcx --config config.json reload
+tcx --config config.json reset personal --list
+tcx --config config.json reset personal
+tcx --config config.json reset personal --credit crd_123 --yes
 tcx --config config.json codex-config
 tcx --config config.json run --group reserved -- exec "Run the tests"
 ```
@@ -266,7 +272,7 @@ tcx --config config.json run --group reserved -- exec "Run the tests"
 `tcx status` prints one table row per account on a terminal and the raw JSON when piped. `--json` and `--table` force one form.
 `LIMIT AT` is the account's effective threshold. The status JSON carries it as `threshold_percent` on each account.
 The `5H LEFT` and `WEEK LEFT` columns show the unused share of the Codex windows and the countdown to their reset.
-`OTHER LIMITS` lists any other window at or over `threshold_percent`. `NOTE` shows the last error and an active hold.
+`OTHER LIMITS` lists any other window at or over `threshold_percent`. `RESETS` is the count of usage-limit reset credits the account can redeem. `NOTE` shows the last error and an active hold.
 
 Account controls change runtime state. Update the configuration to preserve a disabled state across restarts.
 
@@ -276,6 +282,20 @@ Accounts removed from the file are disabled and keep their status row until rest
 Usage counters, holds, and runtime account controls survive a reload.
 In the terminal display, use `j` and `k` to select an account.
 Use Space to change its state. Use `q` to stop the server.
+
+### Usage-limit reset credits
+
+ChatGPT grants some plans reset credits. One credit clears the account's Codex usage windows at once. Codex offers the same action under `/usage` as "Redeem usage limit reset".
+The usage poll records each account's available credits. The status JSON carries them as `reset_credits`, with `resets`, `last_reset`, and `reset_retry_at`.
+
+`tcx reset <account> --list` prints the account's credits: id, status, title, and expiry.
+`tcx reset <account>` redeems the next available credit after a confirmation prompt. `--credit <id>` selects one credit. `--yes` skips the prompt; a non-terminal stdin requires it.
+The command reports the upstream outcome: `reset`, `nothing_to_reset`, `no_credit`, or `already_redeemed`. Only `reset` spends a credit.
+After a redeem the server probes the account's usage, so the pool selects it again without waiting for the next poll.
+
+Set `auto_reset: true` on an account to redeem without a command. The server redeems when a request finds no eligible account, the account matches the request, a Codex window blocks it, and it holds a credit.
+One redeem serves a burst of concurrent requests. The server waits `300` seconds before the next automatic redeem on the same account and never redeems for a disabled account.
+Automatic redeems log `reset_redeemed` and `reset_failed` events to stderr.
 
 `codex-config` prints TOML settings for manual setup.
 `run` passes these settings to Codex for one process.
@@ -292,6 +312,8 @@ All routes require `Authorization: Bearer <local proxy token>`.
 | GET | `/status` | Account quota, usage, errors, and recent outcomes. |
 | POST | `/accounts/{name}/enabled` | Change account state with `{"enabled": true}`. |
 | POST | `/reload` | Apply the configuration file; returns `added`, `updated`, `removed`, `restart_required`. |
+| GET | `/accounts/{name}/reset-credits` | List the account's usage-limit reset credits from the upstream. |
+| POST | `/accounts/{name}/reset` | Redeem one reset credit. Optional body: `{"credit_id": "...", "request_id": "..."}`. Returns `code`, `windows_reset`, `reset_credits`, `quotas`. |
 | POST | `/v1/responses` | Forward a Responses API request. |
 | POST | `/v1/responses/compact` | Forward a compaction request. |
 | GET | `/v1/models` | Forward the model list request. |

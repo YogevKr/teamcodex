@@ -62,6 +62,10 @@ pub struct Account {
     /// Per-account override of the top-level `threshold_percent`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub threshold_percent: Option<f64>,
+    /// Redeem a usage-limit reset credit automatically when this account is
+    /// the only limited candidate for a request. Default: `false`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub auto_reset: bool,
 }
 
 #[derive(Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
@@ -146,6 +150,17 @@ impl Account {
             (self.kind == Kind::Chatgpt && self.base_url.is_none())
                 .then_some("https://chatgpt.com/backend-api/wham/usage")
         })
+    }
+
+    /// The usage-limit reset credit endpoint. It lives next to the usage
+    /// endpoint, so only ChatGPT accounts with a usage endpoint have one.
+    pub fn reset_credits(&self) -> Option<String> {
+        if self.kind != Kind::Chatgpt {
+            return None;
+        }
+        let usage = self.usage()?;
+        let base = usage.strip_suffix("/usage")?;
+        Some(format!("{base}/rate-limit-reset-credits"))
     }
 }
 

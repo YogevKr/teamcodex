@@ -86,7 +86,7 @@ fn config(base: &str) -> Config {
                 argv: vec!["python3".into(), "-c".into(), format!("import json; print(json.dumps({{'access_token':'test-upstream-{name}'}}))")],
                 cache_seconds: 240,
             },
-            priority: 0, disabled: false, groups: vec![], models: vec![], threshold_percent: None,
+            priority: 0, disabled: false, groups: vec![], models: vec![], threshold_percent: None, auto_reset: false,
         }).collect(),
     }
 }
@@ -1584,4 +1584,197 @@ async fn reload_endpoint_and_watcher_apply_the_configuration_file() {
     assert_eq!(pool.len(), 4);
     assert_eq!(pool.account(3).unwrap().name, "d");
     assert!(mock.calls.lock().unwrap().is_empty());
+}
+
+/// A ChatGPT-style upstream that serves usage, the reset credit list, and
+/// the consume route. `used` is the Codex window's used percent; the consume
+/// route clears it and spends the credit.
+fn reset_upstream(used: Arc<Mutex<f64>>, credits: Arc<Mutex<i64>>) -> Mock {
+    mock(move |_, path, body| {
+        match path {
+        "/usage" => Json(json!({
+            "rate_limit": {"primary_window": {"used_percent": *used.lock().unwrap(), "reset_at": now() + 3600, "limit_window_seconds": 604800}},
+            "rate_limit_reset_credits": {"available_count": *credits.lock().unwrap()}
+        }))
+        .into_response(),
+        "/rate-limit-reset-credits" => Json(json!({
+            "available_count": *credits.lock().unwrap(),
+            "credits": [{"id": "crd_1", "reset_type": "codex_rate_limits", "status": "available",
+                "granted_at": "2026-09-01T00:00:00Z", "expires_at": null, "title": null, "description": null}]
+        }))
+        .into_response(),
+        "/rate-limit-reset-credits/consume" => {
+            let request: Value = serde_json::from_slice(body).unwrap();
+            assert!(!request["redeem_request_id"].as_str().unwrap().is_empty());
+            let mut left = credits.lock().unwrap();
+            if *left == 0 {
+                return Json(json!({"code": "no_credit"})).into_response();
+            }
+            *left -= 1;
+            *used.lock().unwrap() = 0.0;
+            Json(json!({"code": "reset", "windows_reset": 1})).into_response()
+        }
+        _ => Json(completed("resp_reset")).into_response(),
+    }
+    })
+}
+
+fn chatgpt_config(base: &str, auto_reset: bool) -> Config {
+    let mut cfg = config(base);
+    cfg.accounts.truncate(1);
+    cfg.accounts[0].kind = Kind::Chatgpt;
+    cfg.accounts[0].account_id = Some("test-account-id".into());
+    cfg.accounts[0].usage_url = Some(format!("{base}/usage"));
+    cfg.accounts[0].auto_reset = auto_reset;
+    cfg
+}
+
+#[tokio::test]
+async fn reset_credit_lists_redeems_and_clears_the_codex_window() {
+    let used = Arc::new(Mutex::new(100.0));
+    let credits = Arc::new(Mutex::new(1));
+    let mock = reset_upstream(used.clone(), credits.clone());
+    let source = upstream(&mock).await;
+    let (pool, server) = gateway(chatgpt_config(&source.url, false)).await;
+    proxy::probe_once(&pool).await;
+    let before = pool.snapshot().accounts.remove(0);
+    assert_eq!(before.reset_credits, Some(1));
+    assert!(pool.select("test", None, None, None, &[]).is_none());
+
+    let client = reqwest::Client::new();
+    let listed: Value = client
+        .get(format!("{}/accounts/a/reset-credits", server.url))
+        .bearer_auth(CLIENT_TOKEN)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(listed["credits"][0]["id"], "crd_1");
+
+    let unknown = client
+        .post(format!("{}/accounts/nobody/reset", server.url))
+        .bearer_auth(CLIENT_TOKEN)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(unknown.status(), 404);
+
+    let redeemed = client
+        .post(format!("{}/accounts/a/reset", server.url))
+        .bearer_auth(CLIENT_TOKEN)
+        .json(&json!({"credit_id": "crd_1"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(redeemed.status(), 200);
+    let body: Value = redeemed.json().await.unwrap();
+    assert_eq!(body["code"], "reset");
+    assert_eq!(body["windows_reset"], 1);
+    assert_eq!(body["reset_credits"], 0);
+    assert_eq!(body["quotas"]["codex-primary"]["used_percent"], 0.0);
+
+    let after = pool.snapshot().accounts.remove(0);
+    assert_eq!(after.resets, 1);
+    assert!(after.last_reset.is_some());
+    assert!(pool.select("test", None, None, None, &[]).is_some());
+    {
+        let calls = mock.calls.lock().unwrap();
+        let consume = calls
+            .iter()
+            .find(|(_, _, uri)| uri.ends_with("/consume"))
+            .expect("consume call");
+        assert_eq!(consume.0["chatgpt-account-id"], "test-account-id");
+        let request: Value = serde_json::from_slice(&consume.1).unwrap();
+        assert_eq!(request["credit_id"], "crd_1");
+        assert!(!calls.iter().any(|(_, _, uri)| uri.ends_with("/responses")));
+    }
+
+    // A second redeem finds no credit and reports it without a proxy error.
+    let empty: Value = client
+        .post(format!("{}/accounts/a/reset", server.url))
+        .bearer_auth(CLIENT_TOKEN)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(empty["code"], "no_credit");
+    assert_eq!(pool.snapshot().accounts[0].reset_credits, Some(0));
+}
+
+#[tokio::test]
+async fn auto_reset_spends_one_credit_for_a_burst_and_respects_the_cooldown() {
+    let used = Arc::new(Mutex::new(100.0));
+    let credits = Arc::new(Mutex::new(2));
+    let mock = reset_upstream(used.clone(), credits.clone());
+    let source = upstream(&mock).await;
+    let (pool, server) = gateway(chatgpt_config(&source.url, true)).await;
+    proxy::probe_once(&pool).await;
+    assert!(pool.select("test", None, None, None, &[]).is_none());
+
+    let burst = futures_util::future::join_all((0..4).map(|_| {
+        post(&server)
+            .json(&json!({"model":"test","prompt_cache_key":"burst"}))
+            .send()
+    }))
+    .await;
+    for response in burst {
+        assert_eq!(response.unwrap().status(), 200);
+    }
+    let consumes = |calls: &Vec<Call>| {
+        calls
+            .iter()
+            .filter(|(_, _, uri)| uri.ends_with("/consume"))
+            .count()
+    };
+    assert_eq!(consumes(&mock.calls.lock().unwrap()), 1);
+    assert_eq!(*credits.lock().unwrap(), 1);
+    let account = pool.snapshot().accounts.remove(0);
+    assert_eq!(account.resets, 1);
+    assert_eq!(account.reset_credits, Some(1));
+    assert!(account.reset_retry_at > now());
+
+    // The window fills again inside the cooldown: the pool reports the limit
+    // and keeps the remaining credit.
+    *used.lock().unwrap() = 100.0;
+    proxy::probe_once(&pool).await;
+    let limited = post(&server)
+        .json(&json!({"model":"test"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(limited.status(), 429);
+    let body: Value = limited.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "pool_exhausted");
+    assert_eq!(consumes(&mock.calls.lock().unwrap()), 1);
+    assert_eq!(*credits.lock().unwrap(), 1);
+}
+
+#[tokio::test]
+async fn accounts_without_opt_in_never_redeem_automatically() {
+    let used = Arc::new(Mutex::new(100.0));
+    let credits = Arc::new(Mutex::new(1));
+    let mock = reset_upstream(used, credits.clone());
+    let source = upstream(&mock).await;
+    let (pool, server) = gateway(chatgpt_config(&source.url, false)).await;
+    proxy::probe_once(&pool).await;
+    let limited = post(&server)
+        .json(&json!({"model":"test"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(limited.status(), 429);
+    assert_eq!(*credits.lock().unwrap(), 1);
+    assert!(
+        !mock
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(_, _, uri)| uri.ends_with("/consume"))
+    );
+    assert_eq!(pool.snapshot().accounts[0].reset_credits, Some(1));
 }

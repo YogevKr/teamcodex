@@ -57,6 +57,19 @@ enum Commands {
     },
     /// Apply the configuration file's account list to the running server.
     Reload,
+    /// Redeem one usage-limit reset credit on an account through the running server.
+    Reset {
+        name: String,
+        /// Redeem this credit id. Default: the next available credit.
+        #[arg(long)]
+        credit: Option<String>,
+        /// List the account's reset credits and stop.
+        #[arg(long, conflicts_with_all = ["credit", "yes"])]
+        list: bool,
+        /// Redeem without a confirmation prompt. Required when stdin is not a terminal.
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
     /// Print a Codex provider configuration without changing existing files.
     CodexConfig,
     /// Run Codex through the proxy, or directly when the proxy is stopped.
@@ -198,11 +211,92 @@ async fn main() -> Result<()> {
                 println!("{}", serde_json::to_string_pretty(&value)?);
             }
         }
+        Commands::Reset {
+            name,
+            credit,
+            list,
+            yes,
+        } => {
+            return reset_account(&config, &name, credit.as_deref(), list, yes).await;
+        }
         Commands::Run { group, args } => {
             return run_codex(&config, group.as_deref(), args).await;
         }
         Commands::Example | Commands::Login { .. } => unreachable!(),
     }
+    Ok(())
+}
+
+/// List an account's usage-limit reset credits and redeem one on request.
+async fn reset_account(
+    config: &Config,
+    name: &str,
+    credit: Option<&str>,
+    list: bool,
+    yes: bool,
+) -> Result<()> {
+    ensure!(
+        config.accounts.iter().any(|a| a.name == name),
+        "unknown account"
+    );
+    let client = reqwest::Client::builder().no_proxy().build()?;
+    let url = format!("http://{}/accounts/{name}", config.listen);
+    let token = config.client_token()?;
+    let credits: serde_json::Value = client
+        .get(format!("{url}/reset-credits"))
+        .bearer_auth(&token)
+        .timeout(std::time::Duration::from_secs(20))
+        .send()
+        .await
+        .context("cannot reach the proxy; is tcx server running?")?
+        .error_for_status()
+        .context("the proxy could not list reset credits")?
+        .json()
+        .await?;
+    let available = teamcodex::quota::reset_credits(&credits).unwrap_or(0);
+    print!("{}", teamcodex::reset::render_credits(&credits));
+    if list {
+        return Ok(());
+    }
+    ensure!(available > 0, "no usage-limit reset credit is available");
+    if !yes {
+        ensure!(
+            std::io::stdin().is_terminal(),
+            "confirmation needs a terminal; pass --yes to redeem without a prompt"
+        );
+        eprint!("Redeem one usage-limit reset on {name}? [y/N] ");
+        let mut answer = String::new();
+        std::io::stdin().read_line(&mut answer)?;
+        if !matches!(answer.trim(), "y" | "Y" | "yes") {
+            println!("Cancelled; no credit was redeemed.");
+            return Ok(());
+        }
+    }
+    let mut body = serde_json::json!({});
+    if let Some(id) = credit {
+        body["credit_id"] = serde_json::json!(id);
+    }
+    let response = client
+        .post(format!("{url}/reset"))
+        .bearer_auth(&token)
+        .json(&body)
+        .timeout(std::time::Duration::from_secs(40))
+        .send()
+        .await
+        .context("cannot reach the proxy; is tcx server running?")?;
+    let status = response.status();
+    let value: serde_json::Value = response.json().await?;
+    ensure!(
+        status.is_success(),
+        "reset failed: {}",
+        value["error"]["message"]
+            .as_str()
+            .unwrap_or("unknown error")
+    );
+    print!(
+        "{}",
+        teamcodex::reset::render_outcome(&value, teamcodex::now())
+    );
     Ok(())
 }
 

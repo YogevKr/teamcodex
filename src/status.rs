@@ -127,6 +127,10 @@ fn account_row(account: &Value, default_threshold: f64, now: u64) -> Vec<String>
         remaining(&quotas, Kind::Short, now),
         remaining(&quotas, Kind::Weekly, now),
         other_limits(&quotas, threshold, now),
+        match account.get("reset_credits").and_then(Value::as_i64) {
+            Some(count) => count.to_string(),
+            None => "-".to_owned(),
+        },
         account["in_flight"].as_u64().unwrap_or(0).to_string(),
         account["requests"].as_u64().unwrap_or(0).to_string(),
         account["errors"].as_u64().unwrap_or(0).to_string(),
@@ -139,13 +143,14 @@ fn account_row(account: &Value, default_threshold: f64, now: u64) -> Vec<String>
     ]
 }
 
-const HEADER: [&str; 11] = [
+const HEADER: [&str; 12] = [
     "ACCOUNT",
     "STATE",
     "LIMIT AT",
     "5H LEFT",
     "WEEK LEFT",
     "OTHER LIMITS",
+    "RESETS",
     "ACTIVE",
     "CALLS",
     "ERRORS",
@@ -217,7 +222,7 @@ mod tests {
             "accounts": [
                 {
                     "name": "personal", "disabled": false, "hold_until": 0, "in_flight": 1,
-                    "requests": 11, "errors": 0, "last_error": null, "last_probe_ok": true,
+                    "requests": 11, "errors": 0, "last_error": null, "last_probe_ok": true, "reset_credits": 2,
                     "quotas": {
                         "codex-primary": {"used_percent": 96.0, "reset_at": 100000, "window_minutes": 10080},
                         "gpt-5.3-codex-spark-primary": {"used_percent": 0.0, "reset_at": 2000, "window_minutes": 300}
@@ -257,7 +262,18 @@ mod tests {
         assert!(personal.contains("  95%  "), "default column: {personal}");
         assert!(personal.contains("  -  "), "no short window: {personal}");
         assert!(personal.contains("4% (+1d03h)"), "{personal}");
+        assert_eq!(
+            personal.split_whitespace().nth(7),
+            Some("2"),
+            "reset credits: {personal}"
+        );
         assert!(personal.contains("  ok  "), "{personal}");
+        let team = row(&text, "team");
+        assert_eq!(
+            team.split_whitespace().nth(7),
+            Some("-"),
+            "unknown credits: {team}"
+        );
     }
 
     #[test]
