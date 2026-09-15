@@ -315,6 +315,7 @@ async fn handle(State(app): State<App>, request: Request) -> Response {
         return routing_error();
     }
     let previous = value.get("previous_response_id").and_then(Value::as_str);
+    let stream_requested = value.get("stream").and_then(Value::as_bool) == Some(true);
     let pinned = match previous {
         Some(id) => match app.pool.response_account(id) {
             Some(idx) => Some(idx),
@@ -527,6 +528,7 @@ async fn handle(State(app): State<App>, request: Request) -> Response {
             lease,
             app.pool.config.idle_timeout_seconds,
             model.to_owned(),
+            stream_requested,
         )
         .await;
     }
@@ -809,10 +811,26 @@ impl Drop for Observation {
     }
 }
 
-async fn forward(upstream: reqwest::Response, lease: Lease, idle: u64, model: String) -> Response {
+async fn forward(
+    upstream: reqwest::Response,
+    lease: Lease,
+    idle: u64,
+    model: String,
+    stream_requested: bool,
+) -> Response {
     let status = upstream.status();
-    let headers = response_headers(upstream.headers());
-    let stream = is_event_stream(upstream.headers());
+    let mut headers = response_headers(upstream.headers());
+    // The upstream can answer a streaming request without a content-type
+    // header. The client asked for a stream, so a successful answer is one:
+    // forward it as it arrives and observe its events. Buffering it would hide
+    // in-stream errors and delay every token until the turn ends.
+    let stream = is_event_stream(upstream.headers()) || (stream_requested && status.is_success());
+    if stream && !headers.contains_key("content-type") {
+        headers.insert(
+            "content-type",
+            HeaderValue::from_static("text/event-stream"),
+        );
+    }
     let mut observation = Observation {
         lease,
         status: status.as_u16(),

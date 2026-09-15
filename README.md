@@ -341,6 +341,7 @@ These rules describe proxy attempts. Codex controls client retries and can submi
 - Status records the failure category, such as `upstream_response_header_timeout` or `upstream_transport_error`. The server also writes a JSON error record to stderr with the account and timestamp. This record survives the 100-entry recent-status window when stderr is retained.
 - Error records exclude raw error text, URLs, headers, credentials, and request bodies. A transport failure does not prove whether the upstream processed the request.
 - Other upstream errors pass through once.
+- A request with `stream: true` receives a streamed answer whenever the upstream status is a success, with or without an upstream `content-type` header. The proxy adds `text/event-stream` when the header is missing. Buffering such an answer would delay every token until the turn ends and hide in-stream errors from the proxy.
 - Stream errors never trigger request replay after streaming starts.
 - A stream rate-limit error puts the account on hold for later requests.
 - An overload rejection, upstream code `server_is_overloaded` or `slow_down`, is what Codex shows as "Selected model is at capacity". Before streaming, the proxy holds the account for the stated delay or 45 seconds and selects another account for the request. Inside a stream, the proxy holds the account the same way without replay. Codex retries on the same session, and the hold moves that retry to another account.

@@ -1023,6 +1023,64 @@ async fn slow_failed_credentials_share_one_cooldown() {
 }
 
 #[tokio::test]
+async fn stream_without_content_type_is_forwarded_and_observed() {
+    // The ChatGPT backend answered streaming requests without a content-type
+    // header on 2026-09-15. The request's `stream: true` decides the branch.
+    let failed = format!(
+        "data: {}\n\n",
+        json!({"type":"error","error":{"code":"server_is_overloaded","message":"Our servers are currently overloaded."}})
+    );
+    let expected = failed.clone();
+    // Plain bodies carry no content-type header, like the upstream.
+    let mock = mock(move |token, _, _| {
+        if token.ends_with("-a") {
+            Response::new(Body::from(failed.clone()))
+        } else {
+            let data = format!(
+                "data: {}\n\n",
+                json!({"type":"response.completed","response":completed("resp_plain")})
+            );
+            Response::new(Body::from(data))
+        }
+    });
+    let source = upstream(&mock).await;
+    let (pool, server) = gateway(config(&source.url)).await;
+    let response = post(&server)
+        .header("session_id", "untyped-stream-session")
+        .json(&json!({"model":"test","stream":true}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    assert_eq!(
+        response.headers().get("content-type").unwrap(),
+        "text/event-stream"
+    );
+    assert_eq!(response.text().await.unwrap(), expected);
+    let snapshot = pool.snapshot();
+    assert_eq!(snapshot.recent[0].outcome, "stream_overloaded");
+    assert!(snapshot.accounts[0].hold_until > now());
+    let response = post(&server)
+        .header("session_id", "untyped-stream-session")
+        .json(&json!({"model":"test","stream":true}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    assert_eq!(
+        response.headers().get("content-type").unwrap(),
+        "text/event-stream"
+    );
+    response.bytes().await.unwrap();
+    let calls = mock.calls.lock().unwrap();
+    assert_eq!(calls.len(), 2);
+    assert_eq!(calls[1].0["authorization"], "Bearer test-upstream-b");
+    let snapshot = pool.snapshot();
+    assert_eq!(snapshot.recent.last().unwrap().outcome, "complete");
+    assert_eq!(snapshot.accounts[1].input_tokens, 11);
+}
+
+#[tokio::test]
 async fn stream_overload_holds_account_so_session_retry_rotates() {
     let failed = format!(
         "data: {}\n\n",
