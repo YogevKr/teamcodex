@@ -861,7 +861,11 @@ async fn forward(
                                     } else {
                                         "stream_failed"
                                     };
-                                    log_failure(&observation.lease.pool, observation.lease.idx, observation.status, outcome, quota::error_code(&event), &observation.model);
+                                    // The upstream sends an `error` event and then `response.failed`
+                                    // for one failure. Record and log the first only.
+                                    if !observation.recorded {
+                                        log_failure(&observation.lease.pool, observation.lease.idx, observation.status, outcome, quota::error_code(&event), &observation.model);
+                                    }
                                     observation.finish(outcome, event.get("response"));
                                 },
                                 _ => {},
