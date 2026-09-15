@@ -651,11 +651,21 @@ impl Pool {
         account.errors += 1;
     }
 
-    pub fn defer(&self, idx: usize, until: u64) {
+    pub fn hold_until(&self, idx: usize) -> Option<u64> {
+        let state = self.state.lock().unwrap();
+        state
+            .accounts
+            .get(idx)
+            .map(|a| a.hold_until)
+            .filter(|until| *until > now())
+    }
+
+    /// Hold without an error increment. The caller records the request outcome.
+    pub fn defer(&self, idx: usize, until: u64, reason: &str) {
         let mut state = self.state.lock().unwrap();
         let account = &mut state.accounts[idx];
         account.hold_until = account.hold_until.max(until);
-        account.last_error = Some("rate_limited".to_owned());
+        account.last_error = Some(reason.to_owned());
     }
 
     pub fn record(&self, idx: usize, status: u16, outcome: &str, response: Option<&Value>) {

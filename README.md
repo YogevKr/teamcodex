@@ -343,6 +343,8 @@ These rules describe proxy attempts. Codex controls client retries and can submi
 - Other upstream errors pass through once.
 - Stream errors never trigger request replay after streaming starts.
 - A stream rate-limit error puts the account on hold for later requests.
+- An overload rejection, upstream code `server_is_overloaded` or `slow_down`, is what Codex shows as "Selected model is at capacity". Before streaming, the proxy holds the account for the stated delay or 45 seconds and selects another account for the request. Inside a stream, the proxy holds the account the same way without replay. Codex retries on the same session, and the hold moves that retry to another account.
+- Every upstream rejection and failed stream writes a JSON failure record to stderr with the account, HTTP status, outcome, upstream error code, model, and hold expiry. It carries no error message text.
 - A streamed model rejection restricts that account and model for later requests. The current stream is not replayed.
 
 `previous_response_id` pins a request to the account that produced that response.

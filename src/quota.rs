@@ -221,11 +221,65 @@ pub fn retry_at(headers: &HeaderMap, timestamp: u64) -> u64 {
     timestamp.saturating_add(seconds.clamp(1, 86400 * 7))
 }
 
-pub fn stream_hold(event: &Value, timestamp: u64) -> Option<u64> {
-    let error = event
+/// Hold length after an upstream overload rejection without a stated delay.
+/// Codex retries within seconds on the same session. The hold moves those
+/// retries to another account while the first account cools down.
+pub const OVERLOAD_HOLD_SECONDS: u64 = 45;
+
+/// Error object of a response or stream event: `response.error`, `error`, or the value itself.
+pub fn error_object(event: &Value) -> &Value {
+    event
         .pointer("/response/error")
         .or_else(|| event.get("error"))
-        .unwrap_or(event);
+        .unwrap_or(event)
+}
+
+/// Upstream error code, bounded for log records. Codes are fixed categories;
+/// messages can carry request data and are never returned here.
+pub fn error_code(event: &Value) -> Option<String> {
+    let error = error_object(event);
+    error
+        .get("code")
+        .or_else(|| error.get("type"))
+        .and_then(Value::as_str)
+        .map(|code| code.chars().take(64).collect())
+}
+
+/// Hold for an overload rejection: `server_is_overloaded` or `slow_down`.
+/// Codex reports both as "Selected model is at capacity". They describe
+/// upstream capacity, not this account's quota, so the hold is short.
+pub fn overload_hold(event: &Value, timestamp: u64) -> Option<u64> {
+    let error = error_object(event);
+    if !matches!(
+        error.get("code").and_then(Value::as_str),
+        Some("server_is_overloaded" | "slow_down")
+    ) {
+        return None;
+    }
+    let seconds = retry_seconds(error).unwrap_or(OVERLOAD_HOLD_SECONDS);
+    Some(
+        timestamp
+            .saturating_add(seconds.clamp(1, 3600))
+            .saturating_add(1),
+    )
+}
+
+/// Seconds from a "Please try again in <duration>" message.
+fn retry_seconds(error: &Value) -> Option<u64> {
+    error
+        .get("message")
+        .and_then(Value::as_str)
+        .and_then(|message| {
+            message
+                .split_once("Please try again in ")
+                .map(|(_, tail)| tail)
+        })
+        .and_then(|tail| tail.split_whitespace().next())
+        .and_then(|duration| duration_seconds(duration.trim_end_matches('.')))
+}
+
+pub fn stream_hold(event: &Value, timestamp: u64) -> Option<u64> {
+    let error = error_object(event);
     if !matches!(
         error.get("code").and_then(Value::as_str),
         Some("rate_limit_exceeded" | "usage_limit_reached")
@@ -239,17 +293,7 @@ pub fn stream_hold(event: &Value, timestamp: u64) -> Option<u64> {
     {
         return Some(reset.max(timestamp.saturating_add(1)));
     }
-    let seconds = error
-        .get("message")
-        .and_then(Value::as_str)
-        .and_then(|message| {
-            message
-                .split_once("Please try again in ")
-                .map(|(_, tail)| tail)
-        })
-        .and_then(|tail| tail.split_whitespace().next())
-        .and_then(|duration| duration_seconds(duration.trim_end_matches('.')))
-        .unwrap_or(30);
+    let seconds = retry_seconds(error).unwrap_or(30);
     // The clock uses whole seconds. One extra second preserves the minimum
     // delay when the rejection arrives near the end of the current second.
     Some(
@@ -263,6 +307,24 @@ pub fn stream_hold(event: &Value, timestamp: u64) -> Option<u64> {
 mod tests {
     use super::*;
     use serde_json::json;
+    #[test]
+    fn overload_codes_hold_briefly_and_report_codes() {
+        let event = json!({"type":"response.failed","response":{"error":{
+            "code":"server_is_overloaded","message":"The server is overloaded."}}});
+        assert_eq!(
+            overload_hold(&event, 100),
+            Some(100 + OVERLOAD_HOLD_SECONDS + 1)
+        );
+        assert_eq!(error_code(&event).as_deref(), Some("server_is_overloaded"));
+        let slow = json!({"error":{"code":"slow_down","message":"Please try again in 20s."}});
+        assert_eq!(overload_hold(&slow, 100), Some(121));
+        assert_eq!(error_code(&slow).as_deref(), Some("slow_down"));
+        let other = json!({"type":"error","code":"usage_limit_reached"});
+        assert_eq!(overload_hold(&other, 100), None);
+        assert_eq!(error_code(&other).as_deref(), Some("usage_limit_reached"));
+        assert_eq!(stream_hold(&event, 100), None);
+        assert_eq!(error_code(&json!({"detail":"x"})), None);
+    }
     #[test]
     fn reads_extra_buckets_and_resets() {
         let q = usage(

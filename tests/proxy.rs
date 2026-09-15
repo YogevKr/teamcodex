@@ -1023,6 +1023,107 @@ async fn slow_failed_credentials_share_one_cooldown() {
 }
 
 #[tokio::test]
+async fn stream_overload_holds_account_so_session_retry_rotates() {
+    let failed = format!(
+        "data: {}\n\n",
+        json!({"type":"response.failed","response":{"error":{
+        "code":"server_is_overloaded","message":"The server is overloaded."}}})
+    );
+    let expected = failed.clone();
+    let mock = mock(move |token, _, _| {
+        if token.ends_with("-a") {
+            ([("content-type", "text/event-stream")], failed.clone()).into_response()
+        } else {
+            sse_response()
+        }
+    });
+    let source = upstream(&mock).await;
+    let (pool, server) = gateway(config(&source.url)).await;
+    let response = post(&server)
+        .header("session_id", "overloaded-session")
+        .json(&json!({"model":"test","stream":true}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    assert_eq!(response.text().await.unwrap(), expected);
+    assert_eq!(
+        mock.calls.lock().unwrap().len(),
+        1,
+        "The failed stream must not be replayed"
+    );
+    let snapshot = pool.snapshot();
+    let hold = teamcodex::quota::OVERLOAD_HOLD_SECONDS;
+    assert!(snapshot.accounts[0].hold_until >= now() + hold - 2);
+    assert!(snapshot.accounts[0].hold_until <= now() + hold + 2);
+    assert_eq!(snapshot.accounts[0].errors, 1);
+    assert_eq!(
+        snapshot.accounts[0].last_error.as_deref(),
+        Some("stream_overloaded")
+    );
+    assert_eq!(snapshot.recent[0].outcome, "stream_overloaded");
+    post(&server)
+        .header("session_id", "overloaded-session")
+        .json(&json!({"model":"test","stream":true}))
+        .send()
+        .await
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+    let calls = mock.calls.lock().unwrap();
+    assert_eq!(calls.len(), 2);
+    assert_eq!(calls[1].0["authorization"], "Bearer test-upstream-b");
+}
+
+#[tokio::test]
+async fn http_overload_rejection_holds_account_and_replays_on_another() {
+    let mock = mock(move |token, _, _| {
+        if token.ends_with("-a") {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                [("content-type", "application/json")],
+                json!({"error":{"code":"slow_down","message":"Please try again in 20s."}})
+                    .to_string(),
+            )
+                .into_response()
+        } else {
+            sse_response()
+        }
+    });
+    let source = upstream(&mock).await;
+    let (pool, server) = gateway(config(&source.url)).await;
+    let response = post(&server)
+        .header("session_id", "overloaded-http-session")
+        .json(&json!({"model":"test","stream":true}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let calls = mock.calls.lock().unwrap();
+    assert_eq!(
+        calls.len(),
+        2,
+        "A rejected request before streaming is replayed"
+    );
+    assert_eq!(calls[0].0["authorization"], "Bearer test-upstream-a");
+    assert_eq!(calls[1].0["authorization"], "Bearer test-upstream-b");
+    let snapshot = pool.snapshot();
+    assert!(snapshot.accounts[0].hold_until >= now() + 19);
+    assert!(snapshot.accounts[0].hold_until <= now() + 22);
+    assert_eq!(
+        snapshot.accounts[0].last_error.as_deref(),
+        Some("upstream_overloaded")
+    );
+    assert!(
+        snapshot
+            .recent
+            .iter()
+            .any(|r| r.outcome == "upstream_overloaded" && r.status == 503)
+    );
+}
+
+#[tokio::test]
 async fn stream_rate_limit_holds_account_for_future_requests_without_replay() {
     let failed = format!(
         "data: {}\n\n",

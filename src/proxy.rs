@@ -434,15 +434,85 @@ async fn handle(State(app): State<App>, request: Request) -> Response {
                 }
             };
             let value = serde_json::from_slice::<Value>(&body).ok();
+            let code = value.as_ref().and_then(quota::error_code);
             if value
                 .as_ref()
                 .is_some_and(|value| models::unavailable(value, model))
             {
                 app.pool.mark_model_unavailable(idx, model);
+                log_failure(
+                    &app.pool,
+                    idx,
+                    status.as_u16(),
+                    "model_unavailable",
+                    code,
+                    model,
+                );
                 app.pool
                     .record_model(idx, status.as_u16(), "model_unavailable", None, model);
                 continue;
             }
+            log_failure(
+                &app.pool,
+                idx,
+                status.as_u16(),
+                "upstream_rejected",
+                code,
+                model,
+            );
+            app.pool.record_model(
+                idx,
+                status.as_u16(),
+                "upstream_rejected",
+                value.as_ref(),
+                model,
+            );
+            return buffered_response(status, headers, body);
+        }
+        if status.is_server_error() && !is_event_stream(upstream.headers()) {
+            // An overload rejection before streaming was not processed upstream.
+            // Hold the account briefly and select another one for this request.
+            let headers = response_headers(upstream.headers());
+            let body = match read_bounded(upstream, MAX_BODY, app.pool.config.idle_timeout_seconds)
+                .await
+            {
+                Ok(body) => body,
+                Err(_) => {
+                    app.pool.record(idx, 502, "response_read_failed", None);
+                    return error(
+                        StatusCode::BAD_GATEWAY,
+                        "response_read_failed",
+                        "Upstream response exceeded limits or ended early",
+                    );
+                }
+            };
+            let value = serde_json::from_slice::<Value>(&body).ok();
+            let code = value.as_ref().and_then(quota::error_code);
+            if let Some(until) = value
+                .as_ref()
+                .and_then(|value| quota::overload_hold(value, now()))
+            {
+                app.pool.defer(idx, until, "overloaded");
+                log_failure(
+                    &app.pool,
+                    idx,
+                    status.as_u16(),
+                    "upstream_overloaded",
+                    code,
+                    model,
+                );
+                app.pool
+                    .record_model(idx, status.as_u16(), "upstream_overloaded", None, model);
+                continue;
+            }
+            log_failure(
+                &app.pool,
+                idx,
+                status.as_u16(),
+                "upstream_rejected",
+                code,
+                model,
+            );
             app.pool.record_model(
                 idx,
                 status.as_u16(),
@@ -693,6 +763,26 @@ fn buffered_response(status: StatusCode, headers: HeaderMap, bytes: Vec<u8>) -> 
     response
 }
 
+/// Write a JSON failure record to stderr. It carries the upstream error code,
+/// a fixed category, and never the message, headers, or request data.
+fn log_failure(
+    pool: &Pool,
+    idx: usize,
+    status: u16,
+    outcome: &str,
+    code: Option<String>,
+    model: &str,
+) {
+    eprintln!(
+        "{}",
+        json!({
+            "at": now(), "account": pool.account(idx).map(|a| a.name),
+            "status": status, "outcome": outcome, "code": code,
+            "model": model, "hold_until": pool.hold_until(idx),
+        })
+    );
+}
+
 struct Observation {
     lease: Lease,
     status: u16,
@@ -741,15 +831,20 @@ async fn forward(upstream: reqwest::Response, lease: Lease, idle: u64, model: St
                             match event.get("type").and_then(Value::as_str) {
                                 Some("response.completed") => observation.finish("complete", event.get("response")),
                                 Some("response.failed" | "response.incomplete" | "error") => {
-                                    if models::unavailable(&event, &observation.model) {
+                                    let outcome = if models::unavailable(&event, &observation.model) {
                                         observation.lease.pool.mark_model_unavailable(observation.lease.idx, &observation.model);
-                                        observation.finish("stream_model_unavailable", event.get("response"));
+                                        "stream_model_unavailable"
                                     } else if let Some(until) = quota::stream_hold(&event, now()) {
-                                        observation.lease.pool.defer(observation.lease.idx, until);
-                                        observation.finish("stream_rate_limited", event.get("response"));
+                                        observation.lease.pool.defer(observation.lease.idx, until, "rate_limited");
+                                        "stream_rate_limited"
+                                    } else if let Some(until) = quota::overload_hold(&event, now()) {
+                                        observation.lease.pool.defer(observation.lease.idx, until, "overloaded");
+                                        "stream_overloaded"
                                     } else {
-                                        observation.finish("stream_failed", event.get("response"));
-                                    }
+                                        "stream_failed"
+                                    };
+                                    log_failure(&observation.lease.pool, observation.lease.idx, observation.status, outcome, quota::error_code(&event), &observation.model);
+                                    observation.finish(outcome, event.get("response"));
                                 },
                                 _ => {},
                             }
