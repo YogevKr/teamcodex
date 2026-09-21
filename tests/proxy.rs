@@ -119,6 +119,112 @@ fn post(server: &Server) -> reqwest::RequestBuilder {
         .bearer_auth(CLIENT_TOKEN)
 }
 
+#[tokio::test]
+async fn large_image_history_reaches_responses_and_compaction_unchanged() {
+    let mock = mock(|_, _, _| Json(completed("resp_images")).into_response());
+    let source = upstream(&mock).await;
+    let (_, server) = gateway(config(&source.url)).await;
+    let image = json!({
+        "type": "input_image",
+        "image_url": format!("data:image/png;base64,{}", "A".repeat(6 * 1024 * 1024)),
+    });
+    let body = serde_json::to_vec(&json!({
+        "model": "test",
+        "input": [
+            {"role": "user", "content": [image.clone(), image.clone(), image]},
+            {"role": "user", "content": "Describe the image style"},
+        ],
+    }))
+    .unwrap();
+    assert!(body.len() > 16 * 1024 * 1024);
+
+    for endpoint in ["/v1/responses", "/v1/responses/compact"] {
+        let response = reqwest::Client::new()
+            .post(format!("{}{endpoint}", server.url))
+            .bearer_auth(CLIENT_TOKEN)
+            .body(body.clone())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200, "{endpoint}");
+        assert_eq!(response.json::<Value>().await.unwrap()["id"], "resp_images");
+    }
+    let calls = mock.calls.lock().unwrap();
+    assert_eq!(calls.len(), 2);
+    for (_, received, _) in calls.iter() {
+        assert_eq!(received.len(), body.len());
+        assert!(received == &body, "Image history must remain unchanged");
+    }
+}
+
+#[tokio::test]
+async fn request_body_limit_accepts_128_mib_and_rejects_one_more_byte() {
+    const LIMIT: usize = 128 * 1024 * 1024;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let source = serve(Router::new().fallback(any({
+        let calls = calls.clone();
+        move |request: Request| {
+            let calls = calls.clone();
+            async move {
+                let mut stream = request.into_body().into_data_stream();
+                let mut received = 0;
+                while let Some(chunk) = stream.next().await {
+                    received += chunk.unwrap().len();
+                }
+                assert_eq!(received, LIMIT);
+                calls.fetch_add(1, Ordering::SeqCst);
+                Json(completed("resp_boundary"))
+            }
+        }
+    })))
+    .await;
+    let (_, server) = gateway(config(&source.url)).await;
+    let prefix = br#"{"model":"test","input":"hello"}"#;
+    let mut body = vec![b' '; LIMIT + 1];
+    body[..prefix.len()].copy_from_slice(prefix);
+    let body = Bytes::from(body);
+
+    let accepted = post(&server)
+        .body(body.slice(..LIMIT))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(accepted.status(), 200);
+    assert_eq!(
+        accepted.json::<Value>().await.unwrap()["id"],
+        "resp_boundary"
+    );
+
+    let chunks = futures_util::stream::iter([
+        Ok::<_, std::io::Error>(body.slice(..LIMIT)),
+        Ok(body.slice(LIMIT..)),
+    ]);
+    for request_body in [body.into(), reqwest::Body::wrap_stream(chunks)] {
+        let rejected = post(&server).body(request_body).send().await.unwrap();
+        assert_eq!(rejected.status(), 413);
+        let error = rejected.json::<Value>().await.unwrap();
+        assert_eq!(error["error"]["code"], "body");
+        assert_eq!(error["error"]["message"], "Request body exceeds 128 MiB");
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn buffered_response_limit_remains_16_mib() {
+    let mock = mock(|_, _, _| "A".repeat(16 * 1024 * 1024 + 1).into_response());
+    let source = upstream(&mock).await;
+    let (_, server) = gateway(config(&source.url)).await;
+    let response = post(&server)
+        .json(&json!({"model": "test", "input": "hello"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 502);
+    let error = response.json::<Value>().await.unwrap();
+    assert_eq!(error["error"]["code"], "response_read_failed");
+    assert_eq!(mock.calls.lock().unwrap().len(), 1);
+}
+
 async fn assert_send_failure(pool: &Pool, response: reqwest::Response, reason: &str) {
     assert_eq!(response.status(), 502);
     let body = response.text().await.unwrap();

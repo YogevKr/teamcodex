@@ -21,7 +21,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-const MAX_BODY: usize = 16 * 1024 * 1024;
+// Codex resends base64 image history on later turns and during compaction.
+const MAX_REQUEST_BODY: usize = 128 * 1024 * 1024;
+const MAX_RESPONSE_BODY: usize = 16 * 1024 * 1024;
 
 /// A connect failure never sends the request, so a retry on the same account
 /// is safe. Codex retries a failed request for about three seconds. The
@@ -251,13 +253,13 @@ async fn handle(State(app): State<App>, request: Request) -> Response {
             "Send an uncompressed JSON request",
         );
     }
-    let bytes = match to_bytes(body, MAX_BODY).await {
+    let bytes = match to_bytes(body, MAX_REQUEST_BODY).await {
         Ok(bytes) => bytes,
         Err(_) => {
             return error(
                 StatusCode::PAYLOAD_TOO_LARGE,
                 "body",
-                "Request body exceeds 16 MiB",
+                "Request body exceeds 128 MiB",
             );
         }
     };
@@ -421,8 +423,12 @@ async fn handle(State(app): State<App>, request: Request) -> Response {
             && !is_event_stream(upstream.headers())
         {
             let headers = response_headers(upstream.headers());
-            let body = match read_bounded(upstream, MAX_BODY, app.pool.config.idle_timeout_seconds)
-                .await
+            let body = match read_bounded(
+                upstream,
+                MAX_RESPONSE_BODY,
+                app.pool.config.idle_timeout_seconds,
+            )
+            .await
             {
                 Ok(body) => body,
                 Err(_) => {
@@ -474,8 +480,12 @@ async fn handle(State(app): State<App>, request: Request) -> Response {
             // An overload rejection before streaming was not processed upstream.
             // Hold the account briefly and select another one for this request.
             let headers = response_headers(upstream.headers());
-            let body = match read_bounded(upstream, MAX_BODY, app.pool.config.idle_timeout_seconds)
-                .await
+            let body = match read_bounded(
+                upstream,
+                MAX_RESPONSE_BODY,
+                app.pool.config.idle_timeout_seconds,
+            )
+            .await
             {
                 Ok(body) => body,
                 Err(_) => {
@@ -892,7 +902,7 @@ async fn forward(
         *response.headers_mut() = headers;
         response
     } else {
-        let bytes = match read_bounded(upstream, MAX_BODY, idle).await {
+        let bytes = match read_bounded(upstream, MAX_RESPONSE_BODY, idle).await {
             Ok(bytes) => bytes,
             Err(_) => {
                 observation.finish("response_read_failed", None);

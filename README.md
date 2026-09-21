@@ -319,7 +319,9 @@ All routes require `Authorization: Bearer <local proxy token>`.
 | GET | `/v1/models` | Forward the model list request. |
 
 Inference routes also accept no prefix or the `/backend-api/codex` prefix.
-The proxy accepts JSON bodies up to 16 MiB.
+The proxy accepts JSON request bodies up to 128 MiB, including image history on later turns and compaction requests.
+It forwards request bytes unchanged. It does not resize or remove images.
+Buffered upstream responses remain limited to 16 MiB. Streamed responses do not have this total size limit.
 It requires uncompressed request bodies.
 
 The proxy replaces client authentication with the selected account token and account ID.
