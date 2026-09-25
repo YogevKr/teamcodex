@@ -2043,3 +2043,120 @@ async fn accounts_without_opt_in_never_redeem_automatically() {
     );
     assert_eq!(pool.snapshot().accounts[0].reset_credits, Some(1));
 }
+
+#[tokio::test]
+async fn upstream_429_holds_the_account_and_records_the_outcome() {
+    let mock = mock(|token, _, _| {
+        if token.ends_with("test-upstream-a") {
+            (StatusCode::TOO_MANY_REQUESTS, [("retry-after", "7")]).into_response()
+        } else {
+            Json(completed("resp_b")).into_response()
+        }
+    });
+    let source = upstream(&mock).await;
+    let (pool, server) = gateway(config(&source.url)).await;
+    let response = post(&server)
+        .json(&json!({"model":"test"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let snapshot = pool.snapshot();
+    let a = &snapshot.accounts[0];
+    assert!(
+        a.hold_until > now() && a.hold_until <= now() + 7,
+        "{}",
+        a.hold_until
+    );
+    assert_eq!(a.last_error.as_deref(), Some("rate_limited"));
+    assert!(
+        snapshot
+            .recent
+            .iter()
+            .any(|r| r.account == "a" && r.status == 429 && r.outcome == "upstream_rate_limited"),
+        "{:?}",
+        snapshot
+            .recent
+            .iter()
+            .map(|r| (&r.account, r.status, &r.outcome))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(snapshot.accounts[1].last_error, None);
+}
+
+#[tokio::test]
+async fn probe_holds_a_broken_credential_until_a_probe_fetches_a_token() {
+    let directory = tempfile::tempdir().unwrap();
+    let flag = directory.path().join("login-ok");
+    let script = "import json,sys\nfrom pathlib import Path\nif not Path(sys.argv[1]).exists(): sys.exit(1)\nprint(json.dumps({'access_token':'test-fresh'}))";
+    let mock = mock(|_, path, _| {
+        assert_eq!(path, "/usage");
+        Json(json!({"rate_limit":{"primary_window":{"used_percent":1,"reset_at":now()+100}}}))
+            .into_response()
+    });
+    let source = upstream(&mock).await;
+    let mut cfg = config(&source.url);
+    cfg.probe_interval_seconds = 60;
+    for account in &mut cfg.accounts {
+        account.kind = Kind::Chatgpt;
+        account.account_id = Some("test-account-id".into());
+        account.usage_url = Some(format!("{}/usage", source.url));
+    }
+    cfg.accounts[0].credential = Credential::Command {
+        argv: vec![
+            "python3".into(),
+            "-c".into(),
+            script.into(),
+            flag.to_str().unwrap().into(),
+        ],
+        cache_seconds: 0,
+    };
+    let pool = Pool::new(cfg).unwrap();
+    proxy::probe_once(&pool).await;
+    let a = pool.snapshot().accounts[0].clone();
+    assert_eq!(a.last_probe_ok, Some(false));
+    assert_eq!(a.last_error.as_deref(), Some("credential_unavailable"));
+    assert!(a.hold_until >= now() + 60, "{}", a.hold_until);
+    assert_eq!(pool.select("test", None, None, None, &[]).unwrap().idx, 1);
+    std::fs::write(&flag, "1").unwrap();
+    // The credential cache refuses reloads for 5 s after a failure.
+    tokio::time::sleep(Duration::from_millis(5100)).await;
+    proxy::probe_once(&pool).await;
+    let a = pool.snapshot().accounts[0].clone();
+    assert_eq!(a.last_probe_ok, Some(true));
+    assert_eq!(a.hold_until, 0);
+    assert_eq!(a.last_error, None);
+}
+
+#[tokio::test]
+async fn selection_tries_probe_failed_accounts_last() {
+    let mock = mock(|token, path, _| {
+        if path == "/usage" && token.ends_with("test-upstream-a") {
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        } else if path == "/usage" {
+            Json(json!({"rate_limit":{"primary_window":{"used_percent":1,"reset_at":now()+100}}}))
+                .into_response()
+        } else {
+            Json(completed("resp")).into_response()
+        }
+    });
+    let source = upstream(&mock).await;
+    let mut cfg = config(&source.url);
+    for account in &mut cfg.accounts {
+        account.kind = Kind::Chatgpt;
+        account.account_id = Some("test-account-id".into());
+        account.usage_url = Some(format!("{}/usage", source.url));
+    }
+    let pool = Pool::new(cfg).unwrap();
+    proxy::probe_once(&pool).await;
+    let snapshot = pool.snapshot();
+    assert_eq!(snapshot.accounts[0].last_probe_ok, Some(false));
+    assert_eq!(
+        snapshot.accounts[0].hold_until, 0,
+        "a usage failure is not a credential hold"
+    );
+    assert_eq!(snapshot.accounts[1].last_probe_ok, Some(true));
+    // Account a is idle and first in order, but its probe failed.
+    assert_eq!(pool.select("test", None, None, None, &[]).unwrap().idx, 1);
+    assert_eq!(pool.select("test", None, None, None, &[1]).unwrap().idx, 0);
+}

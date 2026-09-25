@@ -97,6 +97,17 @@ fn other_limits(quotas: &Quotas, threshold: f64, now: u64) -> String {
     }
 }
 
+/// Reserved groups joined with `/`, or `None` for an account that serves
+/// requests without a group.
+fn groups(account: &Value) -> Option<String> {
+    let names: Vec<&str> = account
+        .get("groups")
+        .and_then(Value::as_array)
+        .map(|g| g.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    (!names.is_empty()).then(|| names.join("/"))
+}
+
 fn account_row(account: &Value, default_threshold: f64, now: u64) -> Vec<String> {
     let threshold = account["threshold_percent"]
         .as_f64()
@@ -114,6 +125,9 @@ fn account_row(account: &Value, default_threshold: f64, now: u64) -> Vec<String>
         None => "-",
     };
     let mut note = Vec::new();
+    if let Some(groups) = groups(account) {
+        note.push(format!("group-only {groups}"));
+    }
     if let Some(error) = account.get("last_error").and_then(Value::as_str) {
         note.push(error.to_owned());
     }
@@ -187,16 +201,28 @@ pub fn render(status: &Value, threshold: f64, now: u64) -> String {
             .collect::<Vec<_>>()
             .join("  ")
     };
-    let ready = rows.iter().filter(|r| r[1] == "ready").count();
+    // A grouped account never takes ungrouped traffic, so it does not count
+    // as ready for the Codex panes that read this header.
+    let group_only = accounts
+        .iter()
+        .zip(&rows)
+        .filter(|(a, r)| r[1] == "ready" && groups(a).is_some())
+        .count();
+    let ready = rows.iter().filter(|r| r[1] == "ready").count() - group_only;
     let routing = match status["routing_healthy"].as_bool() {
         Some(true) => "ok",
         Some(false) => "UNHEALTHY",
         None => "-",
     };
     let mut out = format!(
-        "accounts {}  ready {}  threshold {:.0}%  routing {}\n",
+        "accounts {}  ready {}{}  threshold {:.0}%  routing {}\n",
         rows.len(),
         ready,
+        if group_only > 0 {
+            format!(" (+{group_only} group-only)")
+        } else {
+            String::new()
+        },
         threshold,
         routing
     );
@@ -274,6 +300,23 @@ mod tests {
             Some("-"),
             "unknown credits: {team}"
         );
+    }
+
+    #[test]
+    fn grouped_account_is_marked_group_only_and_not_counted_ready() {
+        let mut status = status();
+        status["accounts"][0]["groups"] = json!(["krig"]);
+        status["accounts"][0]["quotas"] = json!({});
+        let out = render(&status, 95.0, 1000);
+        let first = out.lines().next().unwrap();
+        assert!(first.contains("(+1 group-only)"), "{first}");
+        let row = out.lines().find(|l| l.starts_with("personal")).unwrap();
+        assert!(row.contains("ready"), "{row}");
+        assert!(row.ends_with("group-only krig"), "{row}");
+        let mut status = status.clone();
+        status["accounts"][0]["groups"] = json!([]);
+        let out = render(&status, 95.0, 1000);
+        assert!(!out.contains("group-only"), "{out}");
     }
 
     #[test]

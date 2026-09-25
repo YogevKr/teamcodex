@@ -72,25 +72,28 @@ fn pool_exhausted(resets_at: Option<u64>) -> Response {
 /// A held account is waiting out a transient failure. The answer names the
 /// failure and carries `retry-after`, never a usage-limit reset time that the
 /// upstream did not send.
-fn held(reason: &str) -> Response {
+fn held(reason: &str) -> Refusal {
     match reason {
-        "rate_limited" => error(
+        "rate_limited" => (
             StatusCode::TOO_MANY_REQUESTS,
             "rate_limited",
             "Every eligible account is rate limited; retry after the hold",
         ),
-        "credential_unavailable" | "credential_refresh_failed" | "authentication_failed" => error(
+        r if crate::pool::credential_failure(r) => (
             StatusCode::SERVICE_UNAVAILABLE,
             "credentials_unavailable",
             "No eligible account has working credentials",
         ),
-        _ => error(
+        _ => (
             StatusCode::SERVICE_UNAVAILABLE,
             "upstream_unavailable",
             "An eligible account is waiting out an upstream failure",
         ),
     }
 }
+
+/// Status, error code, and message of a pool refusal.
+type Refusal = (StatusCode, &'static str, &'static str);
 
 fn authorized(headers: &HeaderMap, expected: &str) -> bool {
     let Some(actual) = headers
@@ -353,6 +356,7 @@ async fn handle(State(app): State<App>, request: Request) -> Response {
             Err(_) => {
                 auth_failure = true;
                 app.pool.hold(idx, now() + 30, "credential_unavailable");
+                log_hold(&app.pool, idx, "credential_unavailable", model);
                 continue;
             }
         };
@@ -379,6 +383,7 @@ async fn handle(State(app): State<App>, request: Request) -> Response {
                 Err(_) => {
                     auth_failure = true;
                     app.pool.hold(idx, now() + 30, "credential_refresh_failed");
+                    log_hold(&app.pool, idx, "credential_refresh_failed", model);
                     continue;
                 }
             }
@@ -389,6 +394,7 @@ async fn handle(State(app): State<App>, request: Request) -> Response {
                 connect_failure = true;
                 app.pool
                     .hold(idx, now() + CONNECT_HOLD_SECONDS, "connect_failed");
+                log_hold(&app.pool, idx, "connect_failed", model);
                 continue;
             }
             Err(SendError::Unknown { reason, io_kind }) => {
@@ -403,16 +409,22 @@ async fn handle(State(app): State<App>, request: Request) -> Response {
                 .update_quotas(idx, quota::api_headers(upstream.headers(), model, now()));
         }
         if status == StatusCode::TOO_MANY_REQUESTS {
+            // Record first: the hold reason must stay `rate_limited`, which
+            // the refusal path maps to a transient 429.
+            app.pool
+                .record_model(idx, 429, "upstream_rate_limited", None, model);
             app.pool.hold(
                 idx,
                 quota::retry_at(upstream.headers(), now()),
                 "rate_limited",
             );
+            log_failure(&app.pool, idx, 429, "upstream_rate_limited", None, model);
             continue;
         }
         if status == StatusCode::UNAUTHORIZED {
             auth_failure = true;
             app.pool.hold(idx, now() + 30, "authentication_failed");
+            log_hold(&app.pool, idx, "authentication_failed", model);
             continue;
         }
         if !model.is_empty()
@@ -545,20 +557,20 @@ async fn handle(State(app): State<App>, request: Request) -> Response {
     if !app.pool.routing_healthy() {
         return routing_error();
     }
-    let mut response = if app.pool.model_unavailable(model, group, pinned) {
-        error(
+    let (status, code, message): Refusal = if app.pool.model_unavailable(model, group, pinned) {
+        (
             StatusCode::NOT_FOUND,
             "model_unavailable",
             "No account eligible for this request supports the requested model",
         )
     } else if auth_failure {
-        error(
+        (
             StatusCode::SERVICE_UNAVAILABLE,
             "credentials_unavailable",
             "No eligible account has working credentials",
         )
     } else if connect_failure {
-        error(
+        (
             StatusCode::SERVICE_UNAVAILABLE,
             "upstream_unavailable",
             "Cannot connect to an eligible upstream",
@@ -566,13 +578,55 @@ async fn handle(State(app): State<App>, request: Request) -> Response {
     } else if let Some((_, reason)) = app.pool.active_hold() {
         held(&reason)
     } else {
-        pool_exhausted(app.pool.quota_reset_at())
+        (StatusCode::TOO_MANY_REQUESTS, "pool_exhausted", "")
     };
+    let mut response = if code == "pool_exhausted" {
+        pool_exhausted(app.pool.quota_reset_at())
+    } else {
+        error(status, code, message)
+    };
+    let retry_after = app.pool.retry_seconds();
+    log_refusal(&app.pool, status.as_u16(), code, model, &tried, retry_after);
     response.headers_mut().insert(
         "retry-after",
-        HeaderValue::from_str(&app.pool.retry_seconds().to_string()).unwrap(),
+        HeaderValue::from_str(&retry_after.to_string()).unwrap(),
     );
     response
+}
+
+/// Write a JSON record to stderr when the pool answers a request itself. It
+/// names the accounts this request already tried and the retry-after it sent.
+fn log_refusal(
+    pool: &Pool,
+    status: u16,
+    code: &str,
+    model: &str,
+    tried: &[usize],
+    retry_after: u64,
+) {
+    let tried: Vec<String> = tried
+        .iter()
+        .filter_map(|&idx| pool.account(idx).map(|a| a.name))
+        .collect();
+    eprintln!(
+        "{}",
+        json!({
+            "at": now(), "event": "refused", "status": status, "code": code,
+            "model": model, "tried": tried, "retry_after": retry_after,
+        })
+    );
+}
+
+/// Write a JSON record to stderr for a hold that no upstream response caused:
+/// a failed credential fetch, a failed connection, or a rejected token.
+fn log_hold(pool: &Pool, idx: usize, reason: &str, model: &str) {
+    eprintln!(
+        "{}",
+        json!({
+            "at": now(), "account": pool.account(idx).map(|a| a.name),
+            "outcome": reason, "model": model, "hold_until": pool.hold_until(idx),
+        })
+    );
 }
 
 fn routing_error() -> Response {
@@ -950,8 +1004,10 @@ pub async fn probe_account(pool: &Arc<Pool>, idx: usize) -> anyhow::Result<()> {
     let (account, auth) = pool.entry(idx).context("unknown account")?;
     let account = &account;
     let usage = account.usage().context("no usage endpoint")?;
+    let credential = auth.get(account, None).await;
+    let credential_ok = credential.is_ok();
     let result = async {
-        let token = auth.get(account, None).await?;
+        let token = credential?;
         let get = |token: Token| {
             let mut request = pool
                 .client
@@ -975,9 +1031,21 @@ pub async fn probe_account(pool: &Arc<Pool>, idx: usize) -> anyhow::Result<()> {
         Ok::<(), anyhow::Error>(())
     }
     .await;
-    let mut state = pool.state.lock().unwrap();
-    state.accounts[idx].last_probe = Some(now());
-    state.accounts[idx].last_probe_ok = Some(result.is_ok());
+    {
+        let mut state = pool.state.lock().unwrap();
+        state.accounts[idx].last_probe = Some(now());
+        state.accounts[idx].last_probe_ok = Some(result.is_ok());
+    }
+    if credential_ok {
+        pool.credentials_verified(idx);
+    } else {
+        // A broken login stays out of selection until a probe fetches a
+        // token again. Without this the 30-second request hold expires and
+        // the idle account wins the in-flight tie-break every time.
+        let until = now() + pool.config.probe_interval_seconds.max(30) + 5;
+        pool.defer(idx, until, "credential_unavailable");
+        log_hold(pool, idx, "credential_unavailable", "");
+    }
     result
 }
 

@@ -16,6 +16,14 @@ use std::{
 
 const REMOVED_FROM_CONFIG: &str = "removed_from_config";
 
+/// Hold reasons that a working credential fetch clears.
+pub fn credential_failure(reason: &str) -> bool {
+    matches!(
+        reason,
+        "credential_unavailable" | "credential_refresh_failed" | "authentication_failed"
+    )
+}
+
 const MODEL_RETRY_SECONDS: u64 = 300;
 const MODEL_CACHE_LIMIT: usize = 256;
 
@@ -23,6 +31,9 @@ const MODEL_CACHE_LIMIT: usize = 256;
 pub struct AccountState {
     pub name: String,
     pub disabled: bool,
+    /// Reserved groups from the config. A grouped account never serves a
+    /// request without a matching `x-tcx-group` header.
+    pub groups: Vec<String>,
     pub hold_until: u64,
     pub in_flight: u64,
     pub requests: u64,
@@ -149,6 +160,7 @@ impl Pool {
             .map(|e| AccountState {
                 name: e.account.name.clone(),
                 disabled: e.account.disabled,
+                groups: e.account.groups.clone(),
                 threshold_percent: e.account.threshold(config.threshold_percent),
                 ..Default::default()
             })
@@ -245,6 +257,7 @@ impl Pool {
                 state.accounts.push(AccountState {
                     name: account.name.clone(),
                     disabled: account.disabled,
+                    groups: account.groups.clone(),
                     threshold_percent: account.threshold(self.config.threshold_percent),
                     ..Default::default()
                 });
@@ -274,6 +287,7 @@ impl Pool {
                 live.last_error = None;
             }
             live.threshold_percent = account.threshold(self.config.threshold_percent);
+            live.groups = account.groups.clone();
             entry.account = account;
             summary.updated.push(entry.account.name.clone());
         }
@@ -388,7 +402,12 @@ impl Pool {
                     .filter(|at| *at > timestamp)
                     .min()
                     .unwrap_or(u64::MAX);
-                (account.in_flight, reset, account.selected)
+                (
+                    account.last_probe_ok == Some(false),
+                    account.in_flight,
+                    reset,
+                    account.selected,
+                )
             })
         })?;
         if let Some(key) = session
@@ -649,6 +668,21 @@ impl Pool {
         account.hold_until = account.hold_until.max(until);
         account.last_error = Some(reason.to_owned());
         account.errors += 1;
+    }
+
+    /// A probe fetched a working token. Clear a hold that a failed credential
+    /// fetch placed, so the account returns to selection before the hold ends.
+    pub fn credentials_verified(&self, idx: usize) {
+        let mut state = self.state.lock().unwrap();
+        let account = &mut state.accounts[idx];
+        if account
+            .last_error
+            .as_deref()
+            .is_some_and(credential_failure)
+        {
+            account.hold_until = 0;
+            account.last_error = None;
+        }
     }
 
     pub fn hold_until(&self, idx: usize) -> Option<u64> {
