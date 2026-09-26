@@ -25,6 +25,7 @@ It does not copy source from teamclaude-rs or change that project.
 - Usage polling and quota updates from response headers and stream events.
 - Usage-limit reset credits: a status count, a redeem command, and an opt-in automatic redeem.
 - Account changes after explicit rate limits, rejected credentials, or connection failures.
+- Transient overload holds return retryable 429 responses with `Retry-After`.
 - Streaming, tool calls, compaction, and account pinning for `previous_response_id`.
 - Token totals, cached token totals, optional price estimates, and request outcomes.
 - Terminal display, a status table, JSON status, and account controls.

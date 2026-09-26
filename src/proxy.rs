@@ -79,6 +79,11 @@ fn held(reason: &str) -> Refusal {
             "rate_limited",
             "Every eligible account is rate limited; retry after the hold",
         ),
+        "overloaded" | "stream_overloaded" => (
+            StatusCode::TOO_MANY_REQUESTS,
+            "rate_limit_exceeded",
+            "The selected model is temporarily at capacity; retry shortly",
+        ),
         r if crate::pool::credential_failure(r) => (
             StatusCode::SERVICE_UNAVAILABLE,
             "credentials_unavailable",

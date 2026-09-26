@@ -684,6 +684,58 @@ async fn held_rate_limit_reports_transient_429_without_reset_time() {
 }
 
 #[tokio::test]
+async fn held_overload_reports_retryable_capacity_error() {
+    let failed = format!(
+        "data: {}\n\n",
+        json!({"type":"response.failed","response":{"error":{
+        "code":"server_is_overloaded","message":"The server is overloaded."}}})
+    );
+    let mock = mock(move |_, _, _| {
+        ([("content-type", "text/event-stream")], failed.clone()).into_response()
+    });
+    let source = upstream(&mock).await;
+    let mut cfg = config(&source.url);
+    cfg.accounts.truncate(1);
+    let (pool, server) = gateway(cfg).await;
+
+    let first = post(&server)
+        .header("session_id", "held-overload-session")
+        .json(&json!({"model":"test","stream":true}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(first.status(), StatusCode::OK);
+    first.bytes().await.unwrap();
+
+    let response = post(&server)
+        .header("session_id", "held-overload-session")
+        .json(&json!({"model":"test","stream":true}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    let retry_after: u64 = response.headers()["retry-after"]
+        .to_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!((1..=46).contains(&retry_after), "{retry_after}");
+    let body = response.json::<Value>().await.unwrap();
+    assert_eq!(body["error"]["type"], "rate_limit_exceeded");
+    assert_eq!(body["error"]["code"], "rate_limit_exceeded");
+    assert_eq!(
+        body["error"]["message"],
+        "The selected model is temporarily at capacity; retry shortly"
+    );
+    assert!(body["error"].get("resets_at").is_none());
+    assert_eq!(mock.calls.lock().unwrap().len(), 1);
+    assert_eq!(
+        pool.snapshot().accounts[0].last_error.as_deref(),
+        Some("stream_overloaded")
+    );
+}
+
+#[tokio::test]
 async fn per_account_threshold_overrides_default_and_survives_reload() {
     let mock = mock(|_, _, _| Json(completed("resp_test")).into_response());
     let source = upstream(&mock).await;
