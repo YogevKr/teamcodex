@@ -545,14 +545,15 @@ async fn handle(State(app): State<App>, request: Request) -> Response {
             );
             return buffered_response(status, headers, body);
         }
-        return forward(
-            upstream,
+        let observation = Observation {
             lease,
-            app.pool.config.idle_timeout_seconds,
-            model.to_owned(),
-            stream_requested,
-        )
-        .await;
+            status: upstream.status().as_u16(),
+            recorded: false,
+            model: model.to_owned(),
+            group: group.map(str::to_owned),
+            pinned,
+        };
+        return forward(upstream, observation, stream_requested).await;
     }
     if !app.pool.routing_healthy() {
         return routing_error();
@@ -854,8 +855,63 @@ struct Observation {
     status: u16,
     recorded: bool,
     model: String,
+    group: Option<String>,
+    pinned: Option<usize>,
 }
 impl Observation {
+    fn event(&mut self, event: &Value) -> Option<u64> {
+        self.lease
+            .pool
+            .update_quotas(self.lease.idx, quota::usage(event, now()));
+        match event.get("type").and_then(Value::as_str) {
+            Some("response.completed") => self.finish("complete", event.get("response")),
+            Some("response.failed" | "response.incomplete" | "error") => {
+                let mut retry_at = None;
+                let outcome = if models::unavailable(event, &self.model) {
+                    self.lease
+                        .pool
+                        .mark_model_unavailable(self.lease.idx, &self.model);
+                    "stream_model_unavailable"
+                } else if let Some(until) = quota::stream_hold(event, now()) {
+                    self.lease.pool.defer(self.lease.idx, until, "rate_limited");
+                    "stream_rate_limited"
+                } else if let Some(until) = quota::overload_hold(event, now()) {
+                    self.lease.pool.defer(self.lease.idx, until, "overloaded");
+                    retry_at = Some(
+                        if self.lease.pool.has_eligible(
+                            &self.model,
+                            self.group.as_deref(),
+                            self.pinned,
+                        ) {
+                            now() + 1
+                        } else {
+                            until
+                        },
+                    );
+                    "stream_overloaded"
+                } else {
+                    "stream_failed"
+                };
+                // The upstream sends an `error` event and then `response.failed`
+                // for one failure. Record and log the first only.
+                if !self.recorded {
+                    log_failure(
+                        &self.lease.pool,
+                        self.lease.idx,
+                        self.status,
+                        outcome,
+                        quota::error_code(event),
+                        &self.model,
+                    );
+                }
+                self.finish(outcome, event.get("response"));
+                return retry_at;
+            }
+            _ => {}
+        }
+        None
+    }
+
     fn finish(&mut self, outcome: &str, response: Option<&Value>) {
         if !self.recorded {
             self.lease.pool.record_model(
@@ -877,11 +933,10 @@ impl Drop for Observation {
 
 async fn forward(
     upstream: reqwest::Response,
-    lease: Lease,
-    idle: u64,
-    model: String,
+    mut observation: Observation,
     stream_requested: bool,
 ) -> Response {
+    let idle = observation.lease.pool.config.idle_timeout_seconds;
     let status = upstream.status();
     let mut headers = response_headers(upstream.headers());
     // The upstream can answer a streaming request without a content-type
@@ -895,12 +950,6 @@ async fn forward(
             HeaderValue::from_static("text/event-stream"),
         );
     }
-    let mut observation = Observation {
-        lease,
-        status: status.as_u16(),
-        recorded: false,
-        model,
-    };
     if stream {
         let mut source = upstream.bytes_stream();
         let output = async_stream::stream! {
@@ -908,36 +957,26 @@ async fn forward(
             loop {
                 match tokio::time::timeout(Duration::from_secs(idle), source.next()).await {
                     Ok(Some(Ok(bytes))) => {
-                        for event in parser.feed(&bytes) {
-                            observation.lease.pool.update_quotas(observation.lease.idx, quota::usage(&event, now()));
-                            match event.get("type").and_then(Value::as_str) {
-                                Some("response.completed") => observation.finish("complete", event.get("response")),
-                                Some("response.failed" | "response.incomplete" | "error") => {
-                                    let outcome = if models::unavailable(&event, &observation.model) {
-                                        observation.lease.pool.mark_model_unavailable(observation.lease.idx, &observation.model);
-                                        "stream_model_unavailable"
-                                    } else if let Some(until) = quota::stream_hold(&event, now()) {
-                                        observation.lease.pool.defer(observation.lease.idx, until, "rate_limited");
-                                        "stream_rate_limited"
-                                    } else if let Some(until) = quota::overload_hold(&event, now()) {
-                                        observation.lease.pool.defer(observation.lease.idx, until, "overloaded");
-                                        "stream_overloaded"
-                                    } else {
-                                        "stream_failed"
-                                    };
-                                    // The upstream sends an `error` event and then `response.failed`
-                                    // for one failure. Record and log the first only.
-                                    if !observation.recorded {
-                                        log_failure(&observation.lease.pool, observation.lease.idx, observation.status, outcome, quota::error_code(&event), &observation.model);
-                                    }
-                                    observation.finish(outcome, event.get("response"));
-                                },
-                                _ => {},
+                        for frame in parser.feed(&bytes) {
+                            if let Some(until) = frame.event.as_ref().and_then(|event| observation.event(event)) {
+                                // Codex treats server_is_overloaded as terminal. A rate-limit
+                                // event keeps its bounded retry loop and honors the hold delay.
+                                let seconds = until.saturating_sub(now()).max(1);
+                                let event = json!({"type":"response.failed","response":{"error":{
+                                    "code":"rate_limit_exceeded",
+                                    "message":format!("Model capacity is temporarily unavailable. Please try again in {seconds}s.")
+                                }}});
+                                yield Ok::<Bytes, std::io::Error>(Bytes::from(format!("event: response.failed\ndata: {event}\n\n")));
+                                return;
                             }
+                            yield Ok::<Bytes, std::io::Error>(Bytes::from(frame.bytes));
                         }
-                        yield Ok::<Bytes, std::io::Error>(bytes);
                     }
                     Ok(None) => {
+                        let remaining = parser.finish();
+                        if !remaining.is_empty() {
+                            yield Ok(Bytes::from(remaining));
+                        }
                         if !observation.recorded {
                             observation.finish(if parser.overflowed { "observation_overflow" } else { "stream_truncated" }, None);
                         }

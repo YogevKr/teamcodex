@@ -48,6 +48,10 @@ def main():
     parser.add_argument("--binary", default=str(ROOT / "target/debug/tcx"))
     parser.add_argument("--skip-codex", action="store_true")
     parser.add_argument("--transient-error", action="store_true", help="Return one 503 before the tool cycle")
+    parser.add_argument("--stream-overload", choices=("server_is_overloaded", "slow_down"),
+        help="Return one streamed capacity error before the tool cycle")
+    parser.add_argument("--overload-after-tool", action="store_true",
+        help="Return the capacity error after Codex executes the tool")
     parser.add_argument("--model-unavailable", action="store_true",
         help="First account rejects the model instead of returning a rate limit")
     parser.add_argument("--managed-credentials", action="store_true", help="Use private account files instead of credential commands")
@@ -57,6 +61,10 @@ def main():
     args = parser.parse_args()
     if args.transient_error and args.skip_codex:
         parser.error("--transient-error requires Codex; do not use --skip-codex")
+    if args.overload_after_tool and not args.stream_overload:
+        parser.error("--overload-after-tool requires --stream-overload")
+    if args.stream_overload and (args.skip_codex or args.transient_error or args.model_unavailable):
+        parser.error("--stream-overload requires Codex and cannot combine with other error modes")
     binary = str(Path(args.binary).resolve())
     if not args.skip_codex and not shutil.which("codex"):
         raise SystemExit("Codex CLI is required; install it or use --skip-codex for the process smoke test")
@@ -87,6 +95,19 @@ def main():
                 with lock:
                     observed.append({"token": token, "body": payload, "path": self.path})
                     number = len(observed)
+                if args.stream_overload and number == (3 if args.overload_after_tool else 1):
+                    failure = {"type": "response.failed", "response": {"error": {
+                        "code": args.stream_overload, "message":
+                        "Please try again in 1s." if args.overload_after_tool else "The server is overloaded."}}}
+                    stream = ("data: " + json.dumps(failure) + "\n\n").encode()
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/event-stream")
+                    self.send_header("Content-Length", str(len(stream)))
+                    self.end_headers()
+                    for offset in range(0, len(stream), 7):
+                        self.wfile.write(stream[offset:offset + 7])
+                        self.wfile.flush()
+                    return
                 if args.transient_error and number == 1:
                     failure = b"upstream connect error or disconnect/reset before headers. Connection refused"
                     self.send_response(503)
@@ -113,7 +134,7 @@ def main():
                 tool = next((t for t in tools if t.get("name") in ("exec_command", "shell_command")), None)
                 if tool and not tool_result:
                     name = tool["name"]
-                    command = "printf TEAMCODEX_TOOL_OK > verified.txt"
+                    command = "printf TEAMCODEX_TOOL_OK >> verified.txt"
                     arguments = {"cmd" if name == "exec_command" else "command": command}
                     if name == "exec_command":
                         arguments["workdir"] = str(workspace)
@@ -224,6 +245,10 @@ def main():
             if args.transient_error:
                 assert observed[0] == observed[1], "Retry changed the request"
             assert observed[0]["body"] == observed[1]["body"], "Failover changed the request body"
+            if args.stream_overload:
+                assert len(observed) == (4 if args.overload_after_tool else 3), "Unexpected replay"
+                if args.overload_after_tool:
+                    assert observed[2] == observed[3], "Recovery changed the request after tool execution"
             status_result = subprocess.run(command + ["status"], env=env, capture_output=True, text=True, check=True)
             status = json.loads(status_result.stdout)
             if args.model_unavailable:
@@ -244,7 +269,8 @@ def main():
             print(json.dumps({"result": "PASS", "codex_tool_cycle": not args.skip_codex,
                 "upstream_requests": len(observed), "failover": True, "status": True,
                 "transient_error_recovered": args.transient_error,
-                "failover_reason": "model_unavailable" if args.model_unavailable else "rate_limit",
+                "stream_overload_recovered": args.stream_overload,
+                "failover_reason": "stream_overload" if args.stream_overload else "model_unavailable" if args.model_unavailable else "rate_limit",
                 "managed_credentials": args.managed_credentials, "yolo_launch": args.yolo,
                 "account_controls": True, "input_tokens": status["accounts"][1]["input_tokens"]}, indent=2))
         finally:

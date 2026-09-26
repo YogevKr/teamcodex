@@ -1136,7 +1136,6 @@ async fn stream_without_content_type_is_forwarded_and_observed() {
         "data: {}\n\n",
         json!({"type":"error","error":{"code":"server_is_overloaded","message":"Our servers are currently overloaded."}})
     );
-    let expected = failed.clone();
     // Plain bodies carry no content-type header, like the upstream.
     let mock = mock(move |token, _, _| {
         if token.ends_with("-a") {
@@ -1162,7 +1161,10 @@ async fn stream_without_content_type_is_forwarded_and_observed() {
         response.headers().get("content-type").unwrap(),
         "text/event-stream"
     );
-    assert_eq!(response.text().await.unwrap(), expected);
+    let body = response.text().await.unwrap();
+    assert!(body.contains("rate_limit_exceeded"));
+    assert!(!body.contains("server_is_overloaded"));
+    assert!(body.contains("Please try again in "));
     let snapshot = pool.snapshot();
     assert_eq!(snapshot.recent[0].outcome, "stream_overloaded");
     assert!(snapshot.accounts[0].hold_until > now());
@@ -1193,7 +1195,6 @@ async fn stream_overload_holds_account_so_session_retry_rotates() {
         json!({"type":"response.failed","response":{"error":{
         "code":"server_is_overloaded","message":"The server is overloaded."}}})
     );
-    let expected = failed.clone();
     let mock = mock(move |token, _, _| {
         if token.ends_with("-a") {
             ([("content-type", "text/event-stream")], failed.clone()).into_response()
@@ -1210,7 +1211,10 @@ async fn stream_overload_holds_account_so_session_retry_rotates() {
         .await
         .unwrap();
     assert_eq!(response.status(), 200);
-    assert_eq!(response.text().await.unwrap(), expected);
+    let body = response.text().await.unwrap();
+    assert!(body.contains("rate_limit_exceeded"));
+    assert!(!body.contains("server_is_overloaded"));
+    assert!(body.contains("Please try again in "));
     assert_eq!(
         mock.calls.lock().unwrap().len(),
         1,
@@ -1238,6 +1242,80 @@ async fn stream_overload_holds_account_so_session_retry_rotates() {
     let calls = mock.calls.lock().unwrap();
     assert_eq!(calls.len(), 2);
     assert_eq!(calls[1].0["authorization"], "Bearer test-upstream-b");
+}
+
+#[tokio::test]
+async fn overload_retry_delay_respects_routing_and_replaces_only_the_error() {
+    for restriction in ["none", "single", "group", "pinned"] {
+        let prefix = "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}\n\n";
+        let mock = mock(move |_, _, _| {
+            let error = json!({"code":"slow_down","message":"Please try again in 30s."});
+            let data = format!(
+                "{prefix}data: {}\n\ndata: {}\n\n",
+                json!({"type":"error","error":error}),
+                json!({"type":"response.failed","response":{"error":error}})
+            );
+            let chunks: Vec<_> = data
+                .bytes()
+                .map(|byte| Ok::<_, std::io::Error>(Bytes::from(vec![byte])))
+                .collect();
+            (
+                [("content-type", "text/event-stream")],
+                Body::from_stream(futures_util::stream::iter(chunks)),
+            )
+                .into_response()
+        });
+        let source = upstream(&mock).await;
+        let mut cfg = config(&source.url);
+        if restriction == "single" {
+            cfg.accounts.truncate(1);
+        }
+        if restriction == "group" {
+            cfg.accounts[0].groups = vec!["chosen".into()];
+        }
+        let (pool, server) = gateway(cfg).await;
+        let mut body = json!({"model":"test","stream":true});
+        let mut request = post(&server);
+        if restriction == "group" {
+            request = request.header("x-tcx-group", "chosen");
+        }
+        if restriction == "pinned" {
+            pool.record(0, 200, "complete", Some(&completed("resp_pinned")));
+            body["previous_response_id"] = json!("resp_pinned");
+        }
+        let text = request
+            .json(&body)
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        assert!(text.starts_with(prefix));
+        let frames = teamcodex::sse::Parser::default().feed(text.as_bytes());
+        assert_eq!(
+            frames.len(),
+            2,
+            "Emit one retryable error, not both upstream errors"
+        );
+        let event = frames[1].event.as_ref().unwrap();
+        assert_eq!(event["type"], "response.failed");
+        assert_eq!(event["response"]["error"]["code"], "rate_limit_exceeded");
+        let until = teamcodex::quota::stream_hold(event, now()).unwrap();
+        if restriction == "none" {
+            assert!(
+                until <= now() + 3,
+                "Use the other eligible account promptly"
+            );
+        } else {
+            assert!(
+                until >= now() + 29,
+                "Wait when routing prevents account rotation"
+            );
+        }
+        assert_eq!(mock.calls.lock().unwrap().len(), 1);
+        assert_eq!(pool.snapshot().accounts[0].errors, 1);
+    }
 }
 
 #[tokio::test]

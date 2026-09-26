@@ -3,7 +3,7 @@
 A local account pool and streaming proxy for Codex. The binary name is `tcx`.
 
 TeamCodex selects an account for each request. It tracks quota windows and keeps sessions on eligible accounts.
-It sends OpenAI Responses API streams without changing their bytes.
+It preserves OpenAI Responses API stream bytes except for capacity errors, which it makes retryable for Codex.
 
 ## Why a separate project
 
@@ -346,7 +346,9 @@ These rules describe proxy attempts. Codex controls client retries and can submi
 - A request with `stream: true` receives a streamed answer whenever the upstream status is a success, with or without an upstream `content-type` header. The proxy adds `text/event-stream` when the header is missing. Buffering such an answer would delay every token until the turn ends and hide in-stream errors from the proxy.
 - Stream errors never trigger request replay after streaming starts.
 - A stream rate-limit error puts the account on hold for later requests.
-- An overload rejection, upstream code `server_is_overloaded` or `slow_down`, is what Codex shows as "Selected model is at capacity". Before streaming, the proxy holds the account for the stated delay or 45 seconds and selects another account for the request. Inside a stream, the proxy holds the account the same way without replay. Codex retries on the same session, and the hold moves that retry to another account.
+- An overload rejection uses upstream code `server_is_overloaded` or `slow_down`. Before streaming, the proxy holds the account for the stated delay or 45 seconds and selects another account for the request.
+- Inside a stream, the proxy records the original capacity error and holds the account. It replaces the error with one retryable `response.failed` event using `rate_limit_exceeded`, then ends the stream. Codex retries within the same turn, subject to its normal retry limit. The retry delay is one second when another eligible account exists; otherwise, it covers the account hold. Model restrictions, groups, and response pinning still apply. The proxy does not replay the stream itself.
+- The proxy buffers each stream event up to 4 MiB before forwarding it. Other events keep their original bytes. Oversized events pass through without error conversion.
 - Every upstream rejection and failed stream writes a JSON failure record to stderr with the account, HTTP status, outcome, upstream error code, model, and hold expiry. It carries no error message text.
 - A hold without an upstream response, from a failed credential fetch, a failed connection, or a rejected token, writes a JSON record with the account, outcome, model, and hold expiry.
 - A refusal that the pool answers itself writes a JSON `refused` record with the HTTP status, error code, model, the accounts this request tried, and the `retry-after` it sent. The codes are `pool_exhausted`, `rate_limited`, `credentials_unavailable`, `upstream_unavailable`, and `model_unavailable`.
@@ -387,6 +389,8 @@ python3 -B -m unittest discover -s scripts -p 'test_*.py'
 python3 scripts/e2e.py
 python3 scripts/e2e.py --model-unavailable
 python3 scripts/e2e.py --transient-error
+python3 scripts/e2e.py --stream-overload server_is_overloaded
+python3 scripts/e2e.py --stream-overload slow_down --overload-after-tool
 python3 scripts/e2e.py --managed-credentials --model-unavailable --yolo
 python3 scripts/cli_e2e.py
 python3 scripts/tui_e2e.py
@@ -398,6 +402,8 @@ The first account returns 429. The second account requests a file write in a tem
 Codex executes the command and returns its result through the proxy.
 The test checks the final response, account change, token totals, and account controls.
 The `--model-unavailable` case replaces the first account's rate limit with a model rejection and repeats the tool cycle.
+The `--stream-overload` cases verify automatic capacity recovery through the installed Codex CLI.
+The `--overload-after-tool` case verifies recovery after tool execution without executing that tool twice.
 Local tests use Codex's `workspace-write` sandbox by default.
 The disposable Linux CI runner blocks sandbox user namespaces, so that job passes `--sandbox danger-full-access`.
 Its local mock supplies only the fixed marker command. This option does not change `tcx` defaults.
