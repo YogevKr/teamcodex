@@ -1,385 +1,309 @@
 # TeamCodex
 
-A local account pool and streaming proxy for Codex. The binary name is `tcx`.
+TeamCodex is a local account pool and streaming proxy for the Codex CLI.
+It selects an eligible account for each request and keeps sessions on that account.
 
-TeamCodex selects an account for each request. It tracks quota windows and keeps sessions on eligible accounts.
-It preserves OpenAI Responses API stream bytes except for capacity errors, which it makes retryable for Codex.
+TeamCodex tracks quota windows, usage, account health, model access, and session affinity.
+It forwards Responses API streams and turns temporary capacity errors into retryable responses.
 
-## Why a separate project
-
-[teamclaude-rs](https://github.com/dhkts1/teamclaude-rs) implements the account pool concept for Anthropic.
-Its authentication, quota headers, and stream events depend on Anthropic.
-Its source uses the PolyForm Noncommercial license.
-
-This project implements the concept independently in Rust. It uses the MIT license.
-It does not copy source from teamclaude-rs or change that project.
-
-## Features
-
-- Browser login for each ChatGPT account, private token storage, and automatic OAuth renewal.
-- Optional credential commands and environment variables for external brokers and OpenAI API keys.
-- A credential command with bounded output, timeout, cache, and concurrent refresh control.
-- Priority tiers, reserved groups, model restrictions, and session affinity.
-- Automatic account selection after an explicit model access rejection.
-- Primary, secondary, and configured model quota windows.
-- Usage polling and quota updates from response headers and stream events.
-- Usage-limit reset credits: a status count, a redeem command, and an opt-in automatic redeem.
-- Account changes after explicit rate limits, rejected credentials, or connection failures.
-- Transient overload holds return retryable 429 responses with `Retry-After`.
-- Streaming, tool calls, compaction, and account pinning for `previous_response_id`.
-- Token totals, cached token totals, optional price estimates, and request outcomes.
-- Terminal display, a status table, JSON status, and account controls.
-- A Codex launcher that leaves existing configuration files intact.
+The project is written in Rust and uses the MIT license.
 
 ## Install
 
-Install through the Homebrew tap:
+### Homebrew
 
 ```sh
 brew install yogevkr/tap/teamcodex
 tcx --version
-tcx login --name personal
-tcx accounts
-tcx
 ```
 
-The installed command is `tcx`. Install Codex CLI separately to use `tcx run`.
-Repeat `tcx login --name another-account` for each account you want to add.
-Select the intended account in the browser. Login does not change your existing Codex login.
-A running server takes the new account at once: login asks it to reload, and the server also applies the configuration file within two seconds of any change.
-In another terminal, launch Codex through the running pool:
+### Build from source
+
+Requirements:
+
+- Rust 1.89 or newer
+- Python 3
+- Codex CLI
+
+```sh
+cargo build --release --locked
+./target/release/tcx --version
+```
+
+## Quick start
+
+Log in to each ChatGPT account that TeamCodex should use:
+
+```sh
+tcx login --name personal
+tcx login --name work
+tcx accounts
+```
+
+`tcx login` opens the browser, creates the configuration, and stores OAuth tokens in private state files.
+It does not change the active Codex login.
+
+Start the proxy:
+
+```sh
+tcx server
+```
+
+The terminal display shows account status.
+Use `tcx server --headless` when you do not want the display.
+
+In another terminal, run Codex through the pool:
 
 ```sh
 tcx run -- --yolo
 ```
 
-Without a running proxy, `tcx run` launches Codex directly with its normal login and configuration.
-An explicit `--group` requires a running proxy. An occupied port with failed authentication never triggers direct launch.
+`tcx run` checks the proxy before launch.
+If the proxy is stopped, it launches Codex with its normal configuration.
+A command with `--group` requires a running proxy.
 
-Optional shell aliases:
+The default configuration path is `~/.config/teamcodex/config.json`.
+Use `--config /absolute/path/config.json` to select another file.
+
+Useful aliases:
 
 ```sh
 alias tcxs='tcx server'
 alias tcxy='tcx run -- --yolo'
 ```
 
-The default configuration is `~/.config/teamcodex/config.json`. Use `--config /absolute/path/config.json` for another pool.
-`tcx login` creates the configuration and local proxy token automatically. No environment variables are required for browser login.
-`tcx login --no-browser` prints the login URL without opening the browser.
-The callback uses loopback port 1455. Close other Codex login attempts if that port is occupied.
-Restart a running server after adding accounts. Re-login to an existing account updates its token file automatically.
+## Features
 
-Native accounts use both the ChatGPT user ID and workspace ID. Users in the same workspace remain separate. A new login can repair invalid credential JSON for the same configured identity. File permission and symlink checks still apply. Temporary OAuth errors use a retry delay; explicit expired or revoked refresh tokens require login.
+- Browser OAuth login with automatic token renewal.
+- Managed tokens stored in private local files.
+- Environment variables or credential commands for external brokers.
+- Priority tiers, reserved groups, model restrictions, and session affinity.
+- Quota polling for ChatGPT accounts.
+- Response-header quota tracking for API accounts.
+- Account fallback after model access, credential, rate-limit, or connection errors.
+- Retryable responses for transient overloads.
+- Usage-limit reset credit listing, redemption, and optional automatic redemption.
+- Terminal, table, and JSON status views.
+- A Codex launcher that leaves existing configuration files unchanged.
+- Responses API streaming, tool calls, compaction, and `previous_response_id` routing.
 
-## Build
+## Configuration
 
-Use Rust 1.89 or newer, Python 3, and an installed Codex CLI.
-The end-to-end test currently verifies Codex CLI 0.153.4.
+Print a complete example:
 
 ```sh
-cargo build --release --locked
-./target/release/tcx example > config.json
-./target/release/tcx --config config.json check
+tcx example > config.json
+tcx --config config.json check
 ```
 
-Update the example with your account names and credential commands.
-Configuration files contain credential references, not credentials.
-`check` validates configuration without reading credentials or contacting an upstream.
+The example uses the optional opgate credential adapter.
+Configuration files contain credential references, not credential values.
 
-## Managed credentials
+### Top-level fields
 
-Browser login stores each account's access token, refresh token, account ID, and expiry in a separate private file.
-These files live under `~/.config/teamcodex/config.state/accounts/` for the default configuration.
-The local proxy token lives under the same state directory. Configuration contains only file references and account settings.
-Token files use owner-only permissions (`0600`), atomic replacement, and file locks across processes.
-Storage uses local files rather than an operating-system keychain. Keep these files out of source control and shared backups.
+| Field | Description |
+| --- | --- |
+| `listen` | Loopback address. Default: `127.0.0.1:4269`. |
+| `client_token_env` | Environment variable for the local proxy token. Default: `TEAMCODEX_PROXY_TOKEN`. |
+| `client_token_file` | Private file for the local proxy token. Browser login creates this file. |
+| `threshold_percent` | Stop selecting an account at this quota percentage. Default: `95`. |
+| `probe_interval_seconds` | Usage polling interval. Set `0` to disable polling. Default: `60`. |
+| `idle_timeout_seconds` | Upstream response and stream inactivity limit. Default: `300`. |
+| `model_limits` | Map model names to extra quota bucket IDs. |
+| `prices` | Optional per-million-token price estimates. |
+| `accounts` | Configured account list. Names must be unique. |
 
-The server checks managed accounts every 30 seconds and refreshes access tokens within five minutes of expiry.
-This loop runs even when quota probing is disabled. Concurrent callers share token renewal.
-A 401 can force renewal immediately. A temporary refresh failure keeps an unexpired access token and delays further renewal attempts.
-Rejected refresh credentials require `tcx login` again. Re-login preserves the account's priority, model list, groups, and enabled state.
-`tcx accounts` displays account metadata and login status without displaying tokens.
+### Account fields
 
-## External credentials
+Each account has a `name`, `kind`, and `credential`.
+The `kind` value is `chatgpt` or `api`.
 
-External credential sources remain optional. `tcx example` prints a configuration for the opgate adapter and API fallback.
-Homebrew installs the adapter under `$(brew --prefix teamcodex)/share/teamcodex/examples/`.
+| Field | Description |
+| --- | --- |
+| `base_url` | Upstream URL. Defaults to the ChatGPT Codex backend or OpenAI `/v1`. |
+| `usage_url` | Optional usage endpoint on the same origin. |
+| `account_id` | ChatGPT account identity. |
+| `priority` | Lower values are selected first for new sessions. Default: `0`. |
+| `disabled` | Initial account state. Default: `false`. |
+| `groups` | Restrict an account to requests with a matching `x-tcx-group` header. |
+| `models` | Exact model names allowed for this account. An empty list allows all models. |
+| `threshold_percent` | Per-account quota threshold override. |
+| `auto_reset` | Redeem a reset credit when this account is blocked. Default: `false`. |
 
-Set `client_token_env` to a variable containing a local proxy token, or set `client_token_file` to its private file.
-When the variable is set, it takes precedence over the file.
-The token must contain at least 16 visible ASCII characters.
-Both the proxy and its clients require this token.
-
-Each account chooses one credential source:
-
-```json
-{"type": "env", "name": "OPENAI_API_KEY"}
-```
+Example account entries:
 
 ```json
 {
-  "type": "command",
-  "argv": ["your-credential-broker", "token", "personal"],
-  "cache_seconds": 240
+  "name": "personal",
+  "kind": "chatgpt",
+  "credential": {
+    "type": "command",
+    "argv": ["your-credential-broker", "token", "personal"],
+    "cache_seconds": 240
+  },
+  "priority": 0
 }
 ```
 
-The command runs directly, without a shell. Use absolute paths for scripts.
-It returns this JSON through its private stdout pipe:
+```json
+{
+  "name": "api-fallback",
+  "kind": "api",
+  "credential": {
+    "type": "env",
+    "name": "OPENAI_API_KEY"
+  },
+  "priority": 10,
+  "disabled": true
+}
+```
+
+ChatGPT accounts with browser login use managed credentials.
+ChatGPT accounts with environment credentials also require `account_id`.
+API accounts use API keys or another external credential source.
+
+## Credentials
+
+### Managed credentials
+
+Browser login stores the access token, refresh token, account ID, and expiry in:
+
+```
+~/.config/teamcodex/config.state/accounts/
+```
+
+Token files and the local proxy token use owner-only permissions.
+TeamCodex replaces tokens atomically and locks files across processes.
+Keep the state directory out of source control and shared backups.
+
+The server checks managed accounts every 30 seconds.
+It refreshes tokens within five minutes of expiry.
+A temporary refresh error keeps an unexpired token and delays the next attempt.
+An expired or revoked refresh token requires `tcx login`.
+
+### External credentials
+
+A credential command runs without a shell.
+Use an absolute executable path when needed.
+The command must print this JSON to stdout:
 
 ```json
 {
-  "access_token": "<token supplied by the credential broker>",
-  "account_id": "<ChatGPT account ID>",
+  "access_token": "token-from-the-broker",
+  "account_id": "chatgpt-account-id",
   "expires_at": 1900000000
 }
 ```
 
-`account_id` is required for ChatGPT accounts. An account configuration can also supply this value.
-`expires_at` is an optional Unix timestamp in seconds.
-The proxy rejects tokens that expire within five seconds.
+`account_id` is required for ChatGPT accounts.
+`expires_at` is an optional Unix timestamp.
+The command has a 15-second timeout and a 64-KiB output limit.
+TeamCodex discards command stderr and never prints token values.
 
-For command sources, the external command owns account login, secure storage, and OAuth token renewal.
-The proxy sets `TEAMCODEX_REFRESH=1` when a 401 response requires renewal.
-Otherwise, it sets `TEAMCODEX_REFRESH=0`.
-Concurrent requests share one refresh. Commands have a 15-second timeout and a 64-KiB output limit.
-The proxy discards command stderr and never includes token output in errors or status.
+TeamCodex sets `TEAMCODEX_REFRESH=1` when a 401 response requires renewal.
+It sets `TEAMCODEX_REFRESH=0` for other requests.
+Concurrent requests share one refresh.
 
-Environment credentials remain fixed for the server process.
-Use a command source when credentials can change during operation.
-The proxy does not read Codex authentication files or change the active Codex account.
+The example adapter is at [`examples/opgate-credential.py`](examples/opgate-credential.py).
+It reads values supplied by `opagent` and returns a broker response.
+It does not renew OAuth tokens.
 
-### opgate
+## Account selection and recovery
 
-The example adapter receives these variables from `opagent`:
+TeamCodex uses these rules:
 
-- `CODEX_PERSONAL_ACCESS_TOKEN`
-- `CODEX_PERSONAL_ACCOUNT_ID`
-- `CODEX_PERSONAL_EXPIRES_AT`, when available
+- Lower priority values win when a new session starts.
+- A session stays on its selected account while that account remains eligible.
+- Groups restrict requests to matching accounts.
+- Model restrictions apply per account.
+- Quota thresholds exclude accounts before their limit.
+- The proxy tries another eligible account after a model access rejection.
+- Rate limits, credential failures, and connection failures create temporary holds.
+- Holds include `Retry-After` so Codex can retry.
+- A timeout after connection does not replay the request because its outcome is unknown.
+- Stream errors are never replayed after streaming starts.
 
-Add the values to the `agents` vault and its opgate configuration.
-Set the adapter path in `examples/config.json` to your absolute checkout path.
-The adapter returns the vault token. It does not renew OAuth tokens itself.
-Use a refresh-aware credential broker for unattended OAuth renewal.
+ChatGPT accounts poll `/backend-api/wham/usage` by default.
+API accounts use quota headers from the upstream response.
+The proxy does not infer shared API limits from those headers.
 
-Start each command through opgate when the agent profile supplies `TEAMCODEX_PROXY_TOKEN`:
+The proxy pins requests with `previous_response_id` to the account that produced the response.
+An unavailable pinned account returns HTTP 429.
+An unknown response ID returns HTTP 409 and requires the full conversation history.
+Bindings persist in `<config>.state/routing.jsonl`.
+The journal stores routing hashes and account bindings, not prompts or response text.
+
+### Usage-limit reset credits
+
+ChatGPT can provide credits that reset usage windows.
+List and redeem credits through the running proxy:
 
 ```sh
-opagent ./target/release/tcx --config config.json server
-opagent ./target/release/tcx --config config.json status
-opagent ./target/release/tcx --config config.json run
-opagent ./target/release/tcx --config config.json run -- exec "Explain this repository"
+tcx --config config.json reset personal --list
+tcx --config config.json reset personal
+tcx --config config.json reset personal --credit crd_123 --yes
 ```
 
-## Configuration
-
-| Field | Behavior |
-| --- | --- |
-| `listen` | Loopback address. Default: `127.0.0.1:4269`. |
-| `client_token_env` | Local proxy token variable. Default: `TEAMCODEX_PROXY_TOKEN`. Optional when a token file is configured. |
-| `client_token_file` | Absolute path to a private local proxy token file. Browser login creates it automatically. |
-| `threshold_percent` | Stop selecting an account at this percentage. Default: `95`. Each account can override it. |
-| `probe_interval_seconds` | Usage polling interval. Default: `60`. Set `0` to disable polling. |
-| `idle_timeout_seconds` | Upstream response and stream inactivity limit. Default: `300`. |
-| `model_limits` | Map model names to additional quota bucket IDs. |
-| `prices` | Optional model prices per million tokens, in USD. |
-| `accounts` | Account list. Names must be unique. The server requires at least one account. |
-
-Each account has a `name`, `kind`, and `credential`.
-`kind` is `chatgpt` or `api`.
-
-| Account field | Behavior |
-| --- | --- |
-| `base_url` | Defaults to the ChatGPT Codex backend or OpenAI `/v1`. |
-| `usage_url` | Optional usage endpoint on the same origin. |
-| `account_id` | ChatGPT account identity. Overrides the credential command value. |
-| `priority` | Lower values select first. Default: `0`. |
-| `disabled` | Initial account state. Default: `false`. |
-| `groups` | Reserved groups. Empty accounts serve requests without a group. A grouped account only serves requests that send a matching `x-tcx-group` header; `tcx status` marks it `group-only` and leaves it out of the `ready` count. |
-| `models` | Exact allowed model names. Empty allows any model not temporarily restricted by an upstream rejection. |
-| `threshold_percent` | Override of the top-level threshold for this account, in `(0, 100]`. A reload applies it without a restart. |
-| `auto_reset` | Redeem a usage-limit reset credit automatically when this account blocks a request and holds a credit. Default: `false`. |
-
-ChatGPT accounts without an endpoint override poll `/backend-api/wham/usage`.
-The same poll reads the account's usage-limit reset credits. See "Usage-limit reset credits" below.
-API accounts use response headers; they do not call the ChatGPT usage endpoint.
-API request and token limits apply to the model that produced those headers.
-The proxy does not infer shared API model-family limits from these headers.
-Custom endpoints require HTTPS. HTTP is allowed only for numeric loopback addresses during local tests.
-The proxy does not follow upstream redirects.
-
-Model access can differ between accounts. Set each account's `models` list when you know its available models.
-An empty list means availability is unknown until the upstream responds.
-On an explicit model access rejection, the proxy tries another eligible account with the same model and request body.
-It remembers the rejected account and model for five minutes. Other models can still use that account.
-After five minutes, the account becomes eligible for another attempt with that model.
-The status field `unavailable_models` maps each rejected model to its retry time, in Unix seconds.
-Each account stores at most 256 rejected models. This cache resets when the server restarts.
-
-The proxy recognizes `model_not_found`, `model_access_denied`, and the explicit ChatGPT account model rejection message.
-Generic permission, parameter, endpoint, and safety errors pass through without account changes.
-If every matching account excludes the model, the proxy returns HTTP 404 with code `model_unavailable`.
-Quota exhaustion still returns HTTP 429. The proxy does not substitute a different model.
-That 429 body uses error type `usage_limit_reached` with code `pool_exhausted` and, when known, `resets_at` in Unix seconds.
-Codex reads this type as a final usage-limit error and shows the reset time instead of retrying the bare status.
-`resets_at` is the earliest reset of a quota window that blocks an enabled account. It never comes from a proxy hold.
-When an account with quota left is on a hold, the proxy answers with the hold's cause instead: HTTP 429 `rate_limited` after an upstream rate limit, HTTP 503 `credentials_unavailable` after a credential failure, or HTTP 503 `upstream_unavailable` after a connection failure.
-Each answer carries `retry-after`, so a Codex client retries instead of reporting a usage limit.
-
-Configure model buckets explicitly. The proxy does not guess model names from bucket labels.
-It always applies the default Codex bucket and adds the configured buckets.
-
-```json
-{
-  "model_limits": {
-    "your-spark-model": ["codex-spark"]
-  },
-  "prices": {
-    "your-model": {
-      "input_per_million": 1.0,
-      "cached_input_per_million": 0.1,
-      "output_per_million": 2.0
-    }
-  }
-}
-```
-
-These prices are examples, not current OpenAI prices.
-Price estimates describe API-equivalent token cost. They do not represent subscription charges.
-`unpriced_requests` reports calls without usable pricing or usage data.
-
-An established session stays on its eligible account, even when a higher-priority account recovers.
-Priority tiers select new sessions. Affinity is separate for each model and group.
-Other requests prefer fewer active requests, then the earliest known reset, then the least recent selection.
-A quota window becomes available when its recorded reset time passes.
-Unknown quota remains unknown until the server reports it.
+Set `auto_reset: true` to redeem a credit when a blocked request has no other eligible account.
+One redemption serves concurrent requests.
+TeamCodex waits 300 seconds before another automatic redemption for the same account.
 
 ## Commands
 
 ```sh
-tcx --config config.json server --headless
-tcx --config config.json status
-tcx --config config.json status --json
-tcx --config config.json account personal disable
-tcx --config config.json account personal enable
-tcx --config config.json reload
-tcx --config config.json reset personal --list
-tcx --config config.json reset personal
-tcx --config config.json reset personal --credit crd_123 --yes
-tcx --config config.json codex-config
-tcx --config config.json run --group reserved -- exec "Run the tests"
+tcx login --name NAME              # Add or renew a ChatGPT account
+tcx login --no-browser              # Print the login URL
+tcx accounts                        # List configured accounts
+tcx server [--headless]             # Start the proxy
+tcx check                           # Validate configuration
+tcx status [--json|--table]        # Show live account status
+tcx account NAME enable             # Enable an account until restart
+tcx account NAME disable            # Disable an account until restart
+tcx reload                          # Apply account changes to a running server
+tcx reset NAME --list               # List reset credits
+tcx reset NAME [--credit ID]        # Redeem a reset credit
+tcx codex-config                    # Print Codex provider settings
+tcx run [--group NAME] -- ARGS      # Run Codex through the proxy
+tcx example                         # Print an example configuration
 ```
 
-`tcx status` prints one table row per account on a terminal and the raw JSON when piped. `--json` and `--table` force one form.
-`LIMIT AT` is the account's effective threshold. The status JSON carries it as `threshold_percent` on each account.
-The `5H LEFT` and `WEEK LEFT` columns show the unused share of the Codex windows and the countdown to their reset.
-`OTHER LIMITS` lists any other window at or over `threshold_percent`. `RESETS` is the count of usage-limit reset credits the account can redeem. `NOTE` shows the last error and an active hold.
+Use the global `--config` option before a command:
 
-Account controls change runtime state. Update the configuration to preserve a disabled state across restarts.
+```sh
+tcx --config /absolute/path/config.json status
+```
 
-`reload` applies the configuration file's account list to the running server. The server also watches the file and reloads two seconds after a change.
-New accounts join the pool. Changed accounts update in place; a changed identity or credential source resets that account's credential cache, quota, and routing binding.
-Accounts removed from the file are disabled and keep their status row until restart. Settings other than `accounts` apply on the next start; the reload result reports `restart_required`.
-Usage counters, holds, and runtime account controls survive a reload.
-In the terminal display, use `j` and `k` to select an account.
-Use Space to change its state. Use `q` to stop the server.
+Runtime account enable and disable changes reset on restart.
+Edit `disabled` in the configuration to keep the state.
+The server watches the configuration file and reloads account changes within two seconds.
+Use `tcx reload` to apply changes at once.
 
-### Usage-limit reset credits
-
-ChatGPT grants some plans reset credits. One credit clears the account's Codex usage windows at once. Codex offers the same action under `/usage` as "Redeem usage limit reset".
-The usage poll records each account's available credits. The status JSON carries them as `reset_credits`, with `resets`, `last_reset`, and `reset_retry_at`.
-
-`tcx reset <account> --list` prints the account's credits: id, status, title, and expiry.
-`tcx reset <account>` redeems the next available credit after a confirmation prompt. `--credit <id>` selects one credit. `--yes` skips the prompt; a non-terminal stdin requires it.
-The command reports the upstream outcome: `reset`, `nothing_to_reset`, `no_credit`, or `already_redeemed`. Only `reset` spends a credit.
-After a redeem the server probes the account's usage, so the pool selects it again without waiting for the next poll.
-
-Set `auto_reset: true` on an account to redeem without a command. The server redeems when a request finds no eligible account, the account matches the request, a Codex window blocks it, and it holds a credit.
-One redeem serves a burst of concurrent requests. The server waits `300` seconds before the next automatic redeem on the same account and never redeems for a disabled account.
-Automatic redeems log `reset_redeemed` and `reset_failed` events to stderr.
-
-`codex-config` prints TOML settings for manual setup.
-`run` passes these settings to Codex for one process.
-It selects HTTP streaming and leaves Codex request and stream retries at their normal defaults.
-The proxy handles the permitted account changes.
-
-## HTTP interface
+## HTTP API
 
 All routes require `Authorization: Bearer <local proxy token>`.
 
-| Method | Route | Result |
+| Method | Route | Description |
 | --- | --- | --- |
 | GET | `/health` | Server status and version. |
-| GET | `/status` | Account quota, usage, errors, and recent outcomes. |
-| POST | `/accounts/{name}/enabled` | Change account state with `{"enabled": true}`. |
-| POST | `/reload` | Apply the configuration file; returns `added`, `updated`, `removed`, `restart_required`. |
-| GET | `/accounts/{name}/reset-credits` | List the account's usage-limit reset credits from the upstream. |
-| POST | `/accounts/{name}/reset` | Redeem one reset credit. Optional body: `{"credit_id": "...", "request_id": "..."}`. Returns `code`, `windows_reset`, `reset_credits`, `quotas`. |
+| GET | `/status` | Account quota, usage, errors, and outcomes. |
+| POST | `/accounts/{name}/enabled` | Enable or disable an account. |
+| POST | `/reload` | Reload the configuration file. |
+| GET | `/accounts/{name}/reset-credits` | List upstream reset credits. |
+| POST | `/accounts/{name}/reset` | Redeem a reset credit. |
 | POST | `/v1/responses` | Forward a Responses API request. |
 | POST | `/v1/responses/compact` | Forward a compaction request. |
 | GET | `/v1/models` | Forward the model list request. |
 
-Inference routes also accept no prefix or the `/backend-api/codex` prefix.
-The proxy accepts JSON request bodies up to 128 MiB, including image history on later turns and compaction requests.
-It forwards request bytes unchanged. It does not resize or remove images.
-Buffered upstream responses remain limited to 16 MiB. Streamed responses do not have this total size limit.
-It requires uncompressed request bodies.
-
-The proxy replaces client authentication with the selected account token and account ID.
+Inference routes also accept no prefix and the `/backend-api/codex` prefix.
+The proxy accepts request bodies up to 128 MiB and forwards streamed events as they arrive.
 It drops cookies, client API keys, actor credentials, and unspecified request headers.
-It drops upstream cookies and authentication headers from responses.
-Browser requests with an `Origin` header receive 403.
+Browser requests with an `Origin` header receive HTTP 403.
+Custom upstreams require HTTPS.
+HTTP is allowed only for numeric loopback addresses used by local tests.
 
-## Retry and conversation rules
+## Development
 
-These rules describe proxy attempts. Codex controls client retries and can submit another request after a returned error.
-
-- A 401 response triggers one credential refresh and one retry on that account.
-- A second 401 puts that account on hold and selects another eligible account.
-- A 429 response records `Retry-After`, holds the account with reason `rate_limited`, records `upstream_rate_limited` in status, and selects another eligible account.
-- An explicit model rejection with HTTP 400, 403, or 404 restricts that account and model, then selects another account.
-- A connection failure never reaches the upstream. The proxy retries the connection on the same account twice, after 200 ms and 600 ms. After the last failure the account holds for one second and the proxy selects another eligible account. This keeps a short outage inside the Codex client retry window.
-- A timeout after connection has an unknown outcome. The proxy returns 502 without replay.
-- A failed request before response headers keeps the `upstream_outcome_unknown` error code. Its message includes the failure category, I/O category when available, elapsed milliseconds, and configured timeout.
-- Status records the failure category, such as `upstream_response_header_timeout` or `upstream_transport_error`. The server also writes a JSON error record to stderr with the account and timestamp. This record survives the 100-entry recent-status window when stderr is retained.
-- Error records exclude raw error text, URLs, headers, credentials, and request bodies. A transport failure does not prove whether the upstream processed the request.
-- Other upstream errors pass through once.
-- A request with `stream: true` receives a streamed answer whenever the upstream status is a success, with or without an upstream `content-type` header. The proxy adds `text/event-stream` when the header is missing. Buffering such an answer would delay every token until the turn ends and hide in-stream errors from the proxy.
-- Stream errors never trigger request replay after streaming starts.
-- A stream rate-limit error puts the account on hold for later requests.
-- An overload rejection uses upstream code `server_is_overloaded` or `slow_down`. Before streaming, the proxy holds the account for the stated delay or 45 seconds and selects another account for the request.
-- Inside a stream, the proxy records the original capacity error and holds the account. It replaces the error with one retryable `response.failed` event using `rate_limit_exceeded`, then ends the stream. Codex retries within the same turn, subject to its normal retry limit. The retry delay is one second when another eligible account exists; otherwise, it covers the account hold. Model restrictions, groups, and response pinning still apply. The proxy does not replay the stream itself.
-- The proxy buffers each stream event up to 4 MiB before forwarding it. Other events keep their original bytes. Oversized events pass through without error conversion.
-- Every upstream rejection and failed stream writes a JSON failure record to stderr with the account, HTTP status, outcome, upstream error code, model, and hold expiry. It carries no error message text.
-- A hold without an upstream response, from a failed credential fetch, a failed connection, or a rejected token, writes a JSON record with the account, outcome, model, and hold expiry.
-- A refusal that the pool answers itself writes a JSON `refused` record with the HTTP status, error code, model, the accounts this request tried, and the `retry-after` it sent. The codes are `pool_exhausted`, `rate_limited`, `credentials_unavailable`, `upstream_unavailable`, and `model_unavailable`.
-- A failed credential fetch during a probe holds the account until after the next probe. A probe that fetches a token clears that hold at once. Selection tries accounts whose last probe failed after every other eligible account.
-- A streamed model rejection restricts that account and model for later requests. The current stream is not replayed.
-
-`previous_response_id` pins a request to the account that produced that response.
-An unavailable pinned account returns 429.
-An unknown response ID returns 409 and requires full conversation history.
-A model rejection on a pinned account returns 404. Choose another model or resend full history without `previous_response_id`.
-Response and session records expire after 24 hours. Each record map holds at most 10,000 entries.
-
-The server saves session and response routing in `<config>.state/routing.jsonl` before using new bindings.
-The journal uses private files, a single-writer lock, durable appends, and bounded compaction.
-It stores hashes of routing keys and account bindings. It stores no prompts, response text, or credentials.
-Bindings survive restarts and account reordering. Changed account identities or credential sources invalidate old bindings.
-Unchanged bindings refresh at most once per minute. An incomplete final journal record is discarded after a crash.
-A malformed complete record stops startup. A write failure blocks later requests instead of silently discarding affinity.
-`tcx status` reports `routing_persistent` and `routing_healthy`.
-
-The proxy forwards prompt bytes, `prompt_cache_key`, cache options, session headers, and turn-state headers unchanged.
-It accepts Codex `session-id` and `thread-id` headers and legacy underscore spellings.
-Diagnostic `x-client-request-id` values never override a cache key or create affinity.
-Account fallback can require a new upstream cache. OpenAI controls cache placement, retention, and eviction.
-See [OpenAI prompt caching](https://developers.openai.com/api/docs/guides/prompt-caching).
-
-Usage, holds, and account controls remain in memory and reset on restart. Status totals cover the current server process.
-Upgrading from 0.2.0 cannot recover its in-memory bindings. Restart between active Codex sessions to avoid losing them.
-
-## Verification
+Run the checks used by CI:
 
 ```sh
 cargo fmt --check
@@ -387,58 +311,36 @@ cargo clippy --all-targets --locked -- -D warnings
 cargo test --locked
 cargo build --locked
 python3 -B -m unittest discover -s scripts -p 'test_*.py'
+```
+
+Run the local end-to-end checks:
+
+```sh
 python3 scripts/e2e.py
 python3 scripts/e2e.py --model-unavailable
 python3 scripts/e2e.py --transient-error
 python3 scripts/e2e.py --stream-overload server_is_overloaded
 python3 scripts/e2e.py --stream-overload slow_down --overload-after-tool
-python3 scripts/e2e.py --managed-credentials --model-unavailable --yolo
 python3 scripts/cli_e2e.py
 python3 scripts/tui_e2e.py
 ```
 
-The end-to-end test starts the compiled proxy and a local fake OpenAI server.
-It runs the installed Codex CLI through `tcx run`.
-The first account returns 429. The second account requests a file write in a temporary workspace.
-Codex executes the command and returns its result through the proxy.
-The test checks the final response, account change, token totals, and account controls.
-The `--model-unavailable` case replaces the first account's rate limit with a model rejection and repeats the tool cycle.
-The `--stream-overload` cases verify automatic capacity recovery through the installed Codex CLI.
-The `--overload-after-tool` case verifies recovery after tool execution without executing that tool twice.
-Local tests use Codex's `workspace-write` sandbox by default.
-The disposable Linux CI runner blocks sandbox user namespaces, so that job passes `--sandbox danger-full-access`.
-Its local mock supplies only the fixed marker command. This option does not change `tcx` defaults.
+The end-to-end tests use a local fake upstream.
+They verify account fallback, tool execution, stream recovery, token totals, and account controls.
+The test suite uses Codex CLI 0.153.4.
 
-`python3 scripts/e2e.py --skip-codex` runs the process smoke test without Codex.
-It does not verify the Codex tool cycle.
-
-The terminal test opens a real PTY. It checks rendering, the Space control, and `q` shutdown.
-
-Unit and integration tests cover quota parsing, expired windows, stream boundaries, credential isolation, and concurrent refresh.
-They also check conversation pinning, stream interruption, status, and terminal rendering.
-
-OAuth tests use a local authorization server to verify PKCE, callback validation, token exchange, and account registration.
-Refresh tests verify token rotation, concurrent callers, expiry, temporary failures, and rejected credentials.
-The CLI tests check direct launch, proxy authentication, YOLO argument order, and account-list redaction.
-Local tests use synthetic credentials. They do not prove live ChatGPT or OpenAI account access.
-An opt-in live test uses synthetic prompts through an isolated proxy and your configured native accounts:
+The optional live cache test uses real account quota:
 
 ```sh
 python3 scripts/live_cache_e2e.py --live --config ~/.config/teamcodex/config.json --list-models
 python3 scripts/live_cache_e2e.py --live --config ~/.config/teamcodex/config.json --model MODEL --output artifacts/live-cache.json
 ```
 
-Select a model your account lists. The test uses real account quota.
-It checks reported cached tokens, then repeats after restarting the test proxy and reversing the account order.
-It leaves the existing proxy and sessions running. It reads configuration references; TeamCodex loads credentials.
-Live verification requires completing `tcx login` or supplying an external credential source.
-
 ## Scope
 
-TeamCodex supports Codex through the Responses API over HTTP and SSE.
+TeamCodex supports the Codex Responses API over HTTP and SSE.
 It does not implement WebSocket transport or a macOS menu application.
-Browser OAuth login and token renewal are built in. External credential brokers remain optional.
-The proxy uses each configured account's available quota and respects its reset and hold periods.
+It supports browser OAuth login and external credential brokers.
 
 Protocol references:
 
@@ -447,3 +349,5 @@ Protocol references:
 - [Codex authentication](https://developers.openai.com/codex/auth)
 - [Codex browser OAuth flow](https://github.com/openai/codex/blob/rust-v0.153.4/codex-rs/login/src/server.rs)
 - [Codex token refresh](https://github.com/openai/codex/blob/rust-v0.153.4/codex-rs/login/src/auth/manager.rs)
+
+See [LICENSE](LICENSE) for license terms.
