@@ -5,6 +5,8 @@ import http.server
 import json
 import os
 from pathlib import Path
+import plistlib
+import shutil
 import socket
 import subprocess
 import tempfile
@@ -85,6 +87,30 @@ def main():
             server.shutdown()
             server.server_close()
 
+        # A starved server: the kernel accepts the connection, but nothing answers.
+        # The launch must go through the proxy, not fail or bypass the pool.
+        listen = config["listen"]
+        with socket.socket() as silent:
+            silent.bind(("127.0.0.1", 0))
+            silent.listen(8)
+            config.update(listen=f"127.0.0.1:{silent.getsockname()[1]}")
+            path.write_text(json.dumps(config))
+            slow = run("run", "--", "--yolo", "exec", "hello")
+        assert slow.returncode == 0, slow.stderr
+        assert 'model_provider="teamcodex"' in json.loads(slow.stdout)
+        assert "did not answer its health check" in slow.stderr
+        config.update(listen=listen)
+        path.write_text(json.dumps(config))
+
+        log = workspace / "logs" / "server.log"
+        agent = run("launch-agent", "--log-file", str(log))
+        assert agent.returncode == 0, agent.stderr
+        plist = plistlib.loads(agent.stdout.encode())
+        assert plist["Label"] == "com.yogevkr.teamcodex"
+        assert "ProcessType" not in plist and "StandardErrorPath" not in plist
+        assert plist["ProgramArguments"][1:] == ["--config", str(path), "server", "--headless", "--log-file", str(log)]
+        assert plist["KeepAlive"] is True and plist["RunAtLoad"] is True
+
         account = workspace / "account.json"
         account.write_text(json.dumps({"access_token": "synthetic-access-private", "refresh_token": "synthetic-refresh-private",
             "account_id": "test-account", "user_id": "user-a", "expires_at": int(time.time())+3600, "email": None}))
@@ -103,8 +129,8 @@ def main():
         config["probe_interval_seconds"] = 0
         path.write_text(json.dumps(config))
         server_env = dict(env, TEAMCODEX_CLI_TEST_TOKEN="synthetic-valid-environment-token")
-        process = subprocess.Popen([binary, "--config", str(path), "server", "--headless"], env=server_env,
-            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+        process = subprocess.Popen([binary, "--config", str(path), "server", "--headless", "--log-file", str(log)],
+            env=server_env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
         try:
             deadline = time.monotonic() + 10
             while True:
@@ -117,6 +143,14 @@ def main():
                 except (OSError, urllib.error.URLError):
                     assert process.poll() is None and time.monotonic() < deadline, "Environment token did not override the invalid file"
                     time.sleep(0.05)
+            assert "TeamCodex listening on" in log.read_text()
+            assert log.stat().st_mode & 0o077 == 0
+            # A cleanup tool deletes the log directory; the server recreates it.
+            shutil.rmtree(log.parent)
+            deadline = time.monotonic() + 10
+            while not (log.exists() and "log_reopened" in log.read_text()):
+                assert process.poll() is None and time.monotonic() < deadline, "The server did not reopen its log file"
+                time.sleep(0.1)
         finally:
             process.terminate()
             try:
@@ -125,7 +159,8 @@ def main():
                 process.kill()
                 process.wait(timeout=3)
             process.stderr.close()
-        print("PASS: direct launch, authenticated proxy launch, YOLO exec arguments, redacted account listing, and token precedence")
+        print("PASS: direct launch, authenticated proxy launch, starved proxy launch, YOLO exec arguments, "
+              "LaunchAgent plist, log file recovery, redacted account listing, and token precedence")
 
 
 if __name__ == "__main__":

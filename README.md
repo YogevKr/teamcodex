@@ -60,6 +60,8 @@ tcx run -- --yolo
 
 `tcx run` checks the proxy before launch.
 If the proxy is stopped, it launches Codex with its normal configuration.
+If the proxy accepts the connection but does not answer within 5 seconds, `tcx run` prints a warning and launches Codex through the proxy.
+This happens when heavy CPU load starves the server.
 A command with `--group` requires a running proxy.
 
 The default configuration path is `~/.config/teamcodex/config.json`.
@@ -70,6 +72,30 @@ Useful aliases:
 ```sh
 alias tcxs='tcx server'
 alias tcxy='tcx run -- --yolo'
+```
+
+## Run at login on macOS
+
+Install the server as a LaunchAgent:
+
+```sh
+tcx launch-agent > ~/Library/LaunchAgents/com.yogevkr.teamcodex.plist
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.yogevkr.teamcodex.plist
+```
+
+The plist runs `tcx server --headless --log-file ~/Library/Logs/teamcodex/server.log`.
+The server creates the log directory and reopens the file when a cleanup tool deletes it.
+
+Do not set `ProcessType` to `Background`.
+macOS then runs every server thread at priority 4.
+Under heavy CPU load, the proxy cannot answer Codex for seconds.
+The server logs a `background_priority` event when macOS throttles it.
+
+After you change the plist, load it again:
+
+```sh
+launchctl bootout gui/$(id -u)/com.yogevkr.teamcodex
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.yogevkr.teamcodex.plist
 ```
 
 ## Features
@@ -278,6 +304,8 @@ tcx login --name NAME              # Add or renew a ChatGPT account
 tcx login --no-browser              # Print the login URL
 tcx accounts                        # List configured accounts
 tcx server [--headless]             # Start the proxy
+tcx server --headless --log-file F  # Start the proxy and append output to F
+tcx launch-agent                    # Print a macOS LaunchAgent plist
 tcx check                           # Validate configuration
 tcx status [--json|--table]        # Show live account status
 tcx account NAME enable             # Enable an account until restart

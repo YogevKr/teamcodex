@@ -6,7 +6,7 @@ use teamcodex::{
     config::{self, Config},
     login,
     pool::Pool,
-    proxy, status, tui,
+    proxy, service, status, tui,
 };
 
 #[derive(Parser)]
@@ -37,6 +37,9 @@ enum Commands {
     Server {
         #[arg(long)]
         headless: bool,
+        /// Append stdout and stderr to this file, and reopen it when it is deleted.
+        #[arg(long, requires = "headless")]
+        log_file: Option<PathBuf>,
     },
     /// Check configuration without resolving credentials.
     Check,
@@ -72,6 +75,12 @@ enum Commands {
     },
     /// Print a Codex provider configuration without changing existing files.
     CodexConfig,
+    /// Print a macOS LaunchAgent plist that runs the headless server at login.
+    LaunchAgent {
+        /// Server log file. Default: ~/Library/Logs/teamcodex/server.log.
+        #[arg(long)]
+        log_file: Option<PathBuf>,
+    },
     /// Run Codex through the proxy, or directly when the proxy is stopped.
     Run {
         #[arg(long)]
@@ -86,7 +95,19 @@ enum Commands {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    let command = cli.command.unwrap_or(Commands::Server { headless: false });
+    let mut command = cli.command.unwrap_or(Commands::Server {
+        headless: false,
+        log_file: None,
+    });
+    // Redirect first, so configuration errors reach the log file too.
+    if let Commands::Server {
+        log_file: Some(file),
+        ..
+    } = &mut command
+    {
+        *file = std::path::absolute(&*file)?;
+        service::redirect_output(file)?;
+    }
     if matches!(command, Commands::Example) {
         print!("{}", include_str!("../examples/config.json"));
         return Ok(());
@@ -94,6 +115,23 @@ async fn main() -> Result<()> {
     let path = std::path::absolute(cli.config.map(Ok).unwrap_or_else(config::default_path)?)?;
     if let Commands::Login { name, no_browser } = &command {
         return login::login(&path, name.as_deref(), *no_browser).await;
+    }
+    if let Commands::LaunchAgent { log_file } = &command {
+        let log_file = match log_file {
+            Some(file) => std::path::absolute(file)?,
+            None => service::default_log_file()?,
+        };
+        let home = std::env::var_os("HOME").context("HOME is not set")?;
+        print!(
+            "{}",
+            service::launch_agent(
+                &service::stable_program(&std::env::current_exe()?),
+                &path,
+                &log_file,
+                std::path::Path::new(&home),
+            )
+        );
+        return Ok(());
     }
     let config = if path.try_exists()? {
         Config::load(&path)?
@@ -104,7 +142,7 @@ async fn main() -> Result<()> {
         Commands::Accounts => login::accounts(&config)?,
         Commands::Check => println!("Configuration valid: {} accounts", config.accounts.len()),
         Commands::CodexConfig => print!("{}", provider_config(&config)),
-        Commands::Server { headless } => {
+        Commands::Server { headless, log_file } => {
             ensure!(
                 !config.accounts.is_empty(),
                 "no accounts configured; run tcx login first"
@@ -113,6 +151,7 @@ async fn main() -> Result<()> {
             let listener = tokio::net::TcpListener::bind(config.listen)
                 .await
                 .context("cannot bind proxy address")?;
+            service::warn_if_background();
             let pool =
                 Pool::persistent(config, &path.with_extension("state").join("routing.jsonl"))?;
             pool.set_config_path(path.clone());
@@ -142,6 +181,12 @@ async fn main() -> Result<()> {
                 pool.clone(),
                 std::time::Duration::from_secs(2),
             ));
+            let logs = log_file.map(|file| {
+                tokio::spawn(service::log_file_loop(
+                    file,
+                    std::time::Duration::from_secs(2),
+                ))
+            });
             let ui = if !headless && std::io::stdout().is_terminal() {
                 let ui_stop = stop.clone();
                 Some(tokio::task::spawn_blocking(move || {
@@ -166,6 +211,9 @@ async fn main() -> Result<()> {
             probe.abort();
             refresh.abort();
             reload.abort();
+            if let Some(logs) = logs {
+                logs.abort();
+            }
             signal.abort();
             if let Some(ui) = ui {
                 ui.await??;
@@ -222,7 +270,9 @@ async fn main() -> Result<()> {
         Commands::Run { group, args } => {
             return run_codex(&config, group.as_deref(), args).await;
         }
-        Commands::Example | Commands::Login { .. } => unreachable!(),
+        Commands::Example | Commands::Login { .. } | Commands::LaunchAgent { .. } => {
+            unreachable!()
+        }
     }
     Ok(())
 }
@@ -335,22 +385,34 @@ async fn run_codex(config: &Config, group: Option<&str>, args: Vec<String>) -> R
             .build()?
             .get(format!("http://{}/health", config.listen))
             .bearer_auth(&token)
-            .timeout(std::time::Duration::from_secs(5))
+            .timeout(HEALTH_TIMEOUT)
             .send()
-            .await
-            .context("proxy health check failed")?;
-        ensure!(
-            health.status().is_success(),
-            "proxy health check failed; refusing direct fallback while the port is in use"
-        );
-        let health: serde_json::Value = health
-            .json()
-            .await
-            .context("invalid proxy health response")?;
-        ensure!(
-            health["status"] == "ok" && health.get("version").is_some(),
-            "unexpected service on the proxy port"
-        );
+            .await;
+        match health {
+            // The kernel accepts connections for a server that gets no CPU time,
+            // so a timeout here is almost always a starved TeamCodex. Codex retries
+            // its own requests; launching through the proxy beats refusing.
+            Err(error) if error.is_timeout() => eprintln!(
+                "TeamCodex proxy did not answer its health check within {} s{}; launching Codex through it anyway.",
+                HEALTH_TIMEOUT.as_secs(),
+                load_note()
+            ),
+            health => {
+                let health = health.context("proxy health check failed")?;
+                ensure!(
+                    health.status().is_success(),
+                    "proxy health check failed; refusing direct fallback while the port is in use"
+                );
+                let health: serde_json::Value = health
+                    .json()
+                    .await
+                    .context("invalid proxy health response")?;
+                ensure!(
+                    health["status"] == "ok" && health.get("version").is_some(),
+                    "unexpected service on the proxy port"
+                );
+            }
+        }
         command
             .args(proxied_args(config, group, args)?)
             .env(&config.client_token_env, token);
@@ -364,6 +426,21 @@ async fn run_codex(config: &Config, group: Option<&str>, args: Vec<String>) -> R
     {
         std::process::exit(command.status()?.code().unwrap_or(1));
     }
+}
+
+const HEALTH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// " (load average N)" when the system reports one.
+fn load_note() -> String {
+    #[cfg(unix)]
+    {
+        let mut load = [0f64; 1];
+        // SAFETY: getloadavg writes at most one sample into a one-element buffer.
+        if unsafe { libc::getloadavg(load.as_mut_ptr(), 1) } == 1 {
+            return format!(" (load average {:.0})", load[0]);
+        }
+    }
+    String::new()
 }
 
 fn proxied_args(
