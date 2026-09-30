@@ -156,6 +156,7 @@ pub async fn register(
             priority: 0,
             disabled: false,
             groups: Vec::new(),
+            shared_percent: 0.0,
             models: Vec::new(),
             threshold_percent: None,
             auto_reset: false,

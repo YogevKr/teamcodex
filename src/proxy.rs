@@ -69,18 +69,18 @@ fn pool_exhausted(resets_at: Option<u64>) -> Response {
     (StatusCode::TOO_MANY_REQUESTS, Json(body)).into_response()
 }
 
-/// A held account is waiting out a transient failure. The answer names the
-/// failure and carries `retry-after`, never a usage-limit reset time that the
-/// upstream did not send.
+/// A held account is waiting out a transient failure. The answer uses 503 so
+/// Codex retries it and carries `retry-after`, never a usage-limit reset time
+/// that the upstream did not send.
 fn held(reason: &str) -> Refusal {
     match reason {
         "rate_limited" => (
-            StatusCode::TOO_MANY_REQUESTS,
+            StatusCode::SERVICE_UNAVAILABLE,
             "rate_limited",
             "Every eligible account is rate limited; retry after the hold",
         ),
         "overloaded" | "stream_overloaded" => (
-            StatusCode::TOO_MANY_REQUESTS,
+            StatusCode::SERVICE_UNAVAILABLE,
             "rate_limit_exceeded",
             "The selected model is temporarily at capacity; retry shortly",
         ),
@@ -95,6 +95,47 @@ fn held(reason: &str) -> Refusal {
             "An eligible account is waiting out an upstream failure",
         ),
     }
+}
+
+fn refusal_response(
+    pool: &Pool,
+    model: &str,
+    group: Option<&str>,
+    pinned: Option<usize>,
+    auth_failure: bool,
+    connect_failure: bool,
+) -> (Response, u16, &'static str, u64) {
+    let (status, code, message): Refusal = if pool.model_unavailable(model, group, pinned) {
+        (
+            StatusCode::NOT_FOUND,
+            "model_unavailable",
+            "No account eligible for this request supports the requested model",
+        )
+    } else if auth_failure {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "credentials_unavailable",
+            "No eligible account has working credentials",
+        )
+    } else if connect_failure {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "upstream_unavailable",
+            "Cannot connect to an eligible upstream",
+        )
+    } else if let Some((_, reason)) = pool.active_hold(model, group, pinned) {
+        held(&reason)
+    } else {
+        (StatusCode::TOO_MANY_REQUESTS, "pool_exhausted", "")
+    };
+    let quota_reset = pool.quota_reset_at(model, group, pinned);
+    let retry_after = pool.retry_seconds(model, group, pinned);
+    let response = if code == "pool_exhausted" {
+        pool_exhausted(quota_reset)
+    } else {
+        error(status, code, message)
+    };
+    (response, status.as_u16(), code, retry_after)
 }
 
 /// Status, error code, and message of a pool refusal.
@@ -344,7 +385,7 @@ async fn handle(State(app): State<App>, request: Request) -> Response {
     if !app.pool.has_eligible(model, group, pinned)
         && let Some(idx) = app.pool.auto_reset_candidate(model, group, pinned)
     {
-        reset::auto(&app.pool, idx).await;
+        reset::auto(&app.pool, idx, model, group).await;
     }
     let mut tried = Vec::new();
     let mut auth_failure = false;
@@ -415,7 +456,7 @@ async fn handle(State(app): State<App>, request: Request) -> Response {
         }
         if status == StatusCode::TOO_MANY_REQUESTS {
             // Record first: the hold reason must stay `rate_limited`, which
-            // the refusal path maps to a transient 429.
+            // the refusal path maps to a retryable 503.
             app.pool
                 .record_model(idx, 429, "upstream_rate_limited", None, model);
             app.pool.hold(
@@ -563,36 +604,15 @@ async fn handle(State(app): State<App>, request: Request) -> Response {
     if !app.pool.routing_healthy() {
         return routing_error();
     }
-    let (status, code, message): Refusal = if app.pool.model_unavailable(model, group, pinned) {
-        (
-            StatusCode::NOT_FOUND,
-            "model_unavailable",
-            "No account eligible for this request supports the requested model",
-        )
-    } else if auth_failure {
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "credentials_unavailable",
-            "No eligible account has working credentials",
-        )
-    } else if connect_failure {
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "upstream_unavailable",
-            "Cannot connect to an eligible upstream",
-        )
-    } else if let Some((_, reason)) = app.pool.active_hold() {
-        held(&reason)
-    } else {
-        (StatusCode::TOO_MANY_REQUESTS, "pool_exhausted", "")
-    };
-    let mut response = if code == "pool_exhausted" {
-        pool_exhausted(app.pool.quota_reset_at())
-    } else {
-        error(status, code, message)
-    };
-    let retry_after = app.pool.retry_seconds();
-    log_refusal(&app.pool, status.as_u16(), code, model, &tried, retry_after);
+    let (mut response, status, code, retry_after) = refusal_response(
+        &app.pool,
+        model,
+        group,
+        pinned,
+        auth_failure,
+        connect_failure,
+    );
+    log_refusal(&app.pool, status, code, model, &tried, retry_after);
     response.headers_mut().insert(
         "retry-after",
         HeaderValue::from_str(&retry_after.to_string()).unwrap(),

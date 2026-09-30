@@ -160,9 +160,9 @@ pub async fn redeem(
 /// Redeem for an account that opted in, once per cooldown, when a request
 /// found no eligible account. Concurrent callers wait for one attempt and
 /// then see the cooldown, so one exhausted burst spends one credit.
-pub async fn auto(pool: &Arc<Pool>, idx: usize) {
+pub async fn auto(pool: &Arc<Pool>, idx: usize, model: &str, group: Option<&str>) {
     let _guard = pool.reset_lock.lock().await;
-    if !pool.auto_reset_ready(idx) {
+    if !pool.auto_reset_ready(idx, model, group) {
         return;
     }
     pool.defer_reset(idx, now() + AUTO_RETRY_SECONDS);

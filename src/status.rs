@@ -126,7 +126,12 @@ fn account_row(account: &Value, default_threshold: f64, now: u64) -> Vec<String>
     };
     let mut note = Vec::new();
     if let Some(groups) = groups(account) {
-        note.push(format!("group-only {groups}"));
+        let shared_percent = account["shared_percent"].as_f64().unwrap_or(0.0);
+        if shared_percent > 0.0 {
+            note.push(format!("shared {shared_percent:.0}% {groups}"));
+        } else {
+            note.push(format!("group-only {groups}"));
+        }
     }
     if let Some(error) = account.get("last_error").and_then(Value::as_str) {
         note.push(error.to_owned());
@@ -206,7 +211,11 @@ pub fn render(status: &Value, threshold: f64, now: u64) -> String {
     let group_only = accounts
         .iter()
         .zip(&rows)
-        .filter(|(a, r)| r[1] == "ready" && groups(a).is_some())
+        .filter(|(a, r)| {
+            r[1] == "ready"
+                && groups(a).is_some()
+                && a["shared_percent"].as_f64().unwrap_or(0.0) == 0.0
+        })
         .count();
     let ready = rows.iter().filter(|r| r[1] == "ready").count() - group_only;
     let routing = match status["routing_healthy"].as_bool() {
@@ -310,10 +319,19 @@ mod tests {
         let out = render(&status, 95.0, 1000);
         let first = out.lines().next().unwrap();
         assert!(first.contains("(+1 group-only)"), "{first}");
-        let row = out.lines().find(|l| l.starts_with("personal")).unwrap();
-        assert!(row.contains("ready"), "{row}");
-        assert!(row.ends_with("group-only krig"), "{row}");
+        let grouped_row = out.lines().find(|l| l.starts_with("personal")).unwrap();
+        assert!(grouped_row.contains("ready"), "{grouped_row}");
+        assert!(grouped_row.ends_with("group-only krig"), "{grouped_row}");
+        status["accounts"][0]["shared_percent"] = json!(20.0);
+        let out = render(&status, 95.0, 1000);
+        assert!(!out.contains("group-only"), "{out}");
+        assert!(row(&out, "personal").ends_with("shared 20% krig"));
+        status["accounts"][0]["quotas"] = json!({
+            "codex-primary": {"used_percent": 20.0, "reset_at": 100000, "window_minutes": 300}
+        });
+        assert!(render(&status, 95.0, 1000).starts_with("accounts 3  ready 1"));
         let mut status = status.clone();
+        status["accounts"][0]["shared_percent"] = json!(0.0);
         status["accounts"][0]["groups"] = json!([]);
         let out = render(&status, 95.0, 1000);
         assert!(!out.contains("group-only"), "{out}");

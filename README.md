@@ -125,7 +125,8 @@ The `kind` value is `chatgpt` or `api`.
 | `account_id` | ChatGPT account identity. |
 | `priority` | Lower values are selected first for new sessions. Default: `0`. |
 | `disabled` | Initial account state. Default: `false`. |
-| `groups` | Restrict an account to requests with a matching `x-tcx-group` header. |
+| `groups` | Serve requests with a matching `x-tcx-group` header. Accounts with no groups serve shared requests. |
+| `shared_percent` | Quota percentage available to ungrouped traffic. Default: `0`, which keeps it group-only. |
 | `models` | Exact model names allowed for this account. An empty list allows all models. |
 | `threshold_percent` | Per-account quota threshold override. |
 | `auto_reset` | Redeem a reset credit when this account is blocked. Default: `false`. |
@@ -157,6 +158,24 @@ Example account entries:
   "disabled": true
 }
 ```
+
+To share part of a grouped account, set `shared_percent`:
+
+```json
+{
+  "name": "daybreak",
+  "kind": "chatgpt",
+  "groups": ["daybreak-blue"],
+  "shared_percent": 20,
+  "credential": {
+    "type": "command",
+    "argv": ["your-credential-broker", "token", "daybreak"]
+  }
+}
+```
+
+This account can use up to 20% of its quota for ungrouped traffic.
+Its remaining quota serves `daybreak-blue` traffic.
 
 ChatGPT accounts with browser login use managed credentials.
 ChatGPT accounts with environment credentials also require `account_id`.
@@ -214,12 +233,16 @@ TeamCodex uses these rules:
 
 - Lower priority values win when a new session starts.
 - A session stays on its selected account while that account remains eligible.
-- Groups restrict requests to matching accounts.
+- Groups route requests to matching accounts.
+- Grouped accounts can serve ungrouped traffic up to `shared_percent` quota use.
+- The remaining quota stays available to matching group requests.
 - Model restrictions apply per account.
 - Quota thresholds exclude accounts before their limit.
 - The proxy tries another eligible account after a model access rejection.
 - Rate limits, credential failures, and connection failures create temporary holds.
-- Holds include `Retry-After` so Codex can retry.
+- Temporary holds return HTTP 503 with `Retry-After` so Codex can retry.
+- Quota exhaustion returns HTTP 429 with `usage_limit_reached`.
+- The response includes a reset time when the proxy knows one.
 - A timeout after connection does not replay the request because its outcome is unknown.
 - Stream errors are never replayed after streaming starts.
 
@@ -228,7 +251,7 @@ API accounts use quota headers from the upstream response.
 The proxy does not infer shared API limits from those headers.
 
 The proxy pins requests with `previous_response_id` to the account that produced the response.
-An unavailable pinned account returns HTTP 429.
+An unavailable pinned account returns HTTP 429 when its quota is exhausted.
 An unknown response ID returns HTTP 409 and requires the full conversation history.
 Bindings persist in `<config>.state/routing.jsonl`.
 The journal stores routing hashes and account bindings, not prompts or response text.

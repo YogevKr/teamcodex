@@ -31,9 +31,11 @@ const MODEL_CACHE_LIMIT: usize = 256;
 pub struct AccountState {
     pub name: String,
     pub disabled: bool,
-    /// Reserved groups from the config. A grouped account never serves a
-    /// request without a matching `x-tcx-group` header.
+    /// Groups from the config. A grouped account only serves ungrouped
+    /// requests when `shared_percent` is greater than zero.
     pub groups: Vec<String>,
+    /// Maximum quota usage for ungrouped traffic.
+    pub shared_percent: f64,
     pub hold_until: u64,
     pub in_flight: u64,
     pub requests: u64,
@@ -93,6 +95,25 @@ pub struct Entry {
     pub account: Account,
     pub auth: Arc<Auth>,
     pub binding: String,
+}
+
+fn least_loaded_candidate(candidates: &[usize], state: &State, timestamp: u64) -> Option<usize> {
+    candidates.iter().copied().min_by_key(|&idx| {
+        let account = &state.accounts[idx];
+        let reset = account
+            .quotas
+            .values()
+            .filter_map(|w| w.reset_at)
+            .filter(|at| *at > timestamp)
+            .min()
+            .unwrap_or(u64::MAX);
+        (
+            account.last_probe_ok == Some(false),
+            account.in_flight,
+            reset,
+            account.selected,
+        )
+    })
 }
 
 impl Entry {
@@ -161,6 +182,7 @@ impl Pool {
                 name: e.account.name.clone(),
                 disabled: e.account.disabled,
                 groups: e.account.groups.clone(),
+                shared_percent: e.account.shared_percent,
                 threshold_percent: e.account.threshold(config.threshold_percent),
                 ..Default::default()
             })
@@ -258,6 +280,7 @@ impl Pool {
                     name: account.name.clone(),
                     disabled: account.disabled,
                     groups: account.groups.clone(),
+                    shared_percent: account.shared_percent,
                     threshold_percent: account.threshold(self.config.threshold_percent),
                     ..Default::default()
                 });
@@ -288,6 +311,7 @@ impl Pool {
             }
             live.threshold_percent = account.threshold(self.config.threshold_percent);
             live.groups = account.groups.clone();
+            live.shared_percent = account.shared_percent;
             entry.account = account;
             summary.updated.push(entry.account.name.clone());
         }
@@ -392,24 +416,7 @@ impl Pool {
             .into_iter()
             .filter(|&idx| entries[idx].account.priority == priority)
             .collect();
-        let idx = affinity.or_else(|| {
-            candidates.into_iter().min_by_key(|&idx| {
-                let account = &state.accounts[idx];
-                let reset = account
-                    .quotas
-                    .values()
-                    .filter_map(|w| w.reset_at)
-                    .filter(|at| *at > timestamp)
-                    .min()
-                    .unwrap_or(u64::MAX);
-                (
-                    account.last_probe_ok == Some(false),
-                    account.in_flight,
-                    reset,
-                    account.selected,
-                )
-            })
-        })?;
+        let idx = affinity.or_else(|| least_loaded_candidate(&candidates, &state, timestamp))?;
         if let Some(key) = session
             && state
                 .routing
@@ -466,18 +473,16 @@ impl Pool {
     /// True while an automatic redeem on `idx` still helps: the account opted
     /// in, is enabled, holds a credit, sits outside its cooldown, and a Codex
     /// window still blocks it.
-    pub fn auto_reset_ready(&self, idx: usize) -> bool {
+    pub fn auto_reset_ready(&self, idx: usize, model: &str, group: Option<&str>) -> bool {
         let entries = self.accounts.read().unwrap();
         let state = self.state.lock().unwrap();
         let timestamp = now();
         let (Some(entry), Some(account)) = (entries.get(idx), state.accounts.get(idx)) else {
             return false;
         };
-        entry.account.auto_reset
-            && !account.disabled
-            && account.reset_retry_at <= timestamp
-            && account.reset_credits.is_some_and(|count| count > 0)
-            && self.codex_limited(account, timestamp)
+        account.reset_retry_at <= timestamp
+            && self.matches(&entry.account, idx, model, group, None)
+            && self.resettable(&entry.account, account, model, group, timestamp)
     }
 
     /// Index of the account named `name`.
@@ -521,27 +526,17 @@ impl Pool {
         pinned: Option<usize>,
         timestamp: u64,
     ) -> bool {
-        let limits = self.config.model_limits.get(model);
-        let relevant = |key: &str| {
-            key == "codex-primary"
-                || key == "codex-secondary"
-                || key == format!("api:{model}:requests")
-                || key == format!("api:{model}:tokens")
-                || key == format!("api:{model}:project-tokens")
-                || limits.is_some_and(|ids| {
-                    ids.iter().any(|id| {
-                        key == format!("{}-primary", quota::normalize(id))
-                            || key == format!("{}-secondary", quota::normalize(id))
-                    })
-                })
-        };
-        let limited = account
-            .quotas
-            .iter()
-            .any(|(key, w)| relevant(key) && w.used(timestamp) >= account.threshold_percent);
         !account.disabled
             && account.hold_until <= timestamp
-            && !limited
+            && self
+                .blocking_quotas(
+                    account,
+                    model,
+                    Self::request_limit(account, group),
+                    timestamp,
+                )
+                .next()
+                .is_none()
             && account
                 .unavailable_models
                 .get(model)
@@ -568,12 +563,8 @@ impl Pool {
             .enumerate()
             .filter(|(idx, entry)| {
                 let account = &state.accounts[*idx];
-                entry.account.auto_reset
-                    && self.matches(&entry.account, *idx, model, group, pinned)
-                    && !account.disabled
-                    && account.hold_until <= timestamp
-                    && account.reset_credits.is_some_and(|count| count > 0)
-                    && self.codex_limited(account, timestamp)
+                self.matches(&entry.account, *idx, model, group, pinned)
+                    && self.resettable(&entry.account, account, model, group, timestamp)
             })
             .min_by_key(|(idx, entry)| (entry.account.priority, *idx))
             .map(|(idx, _)| idx)
@@ -593,17 +584,74 @@ impl Pool {
                 || config.models.iter().any(|m| m == model))
             && match group {
                 Some(g) => config.groups.iter().any(|s| s == g),
-                None => config.groups.is_empty(),
+                None => config.groups.is_empty() || config.shared_percent > 0.0,
             }
     }
 
-    /// A reset credit only clears the Codex windows, so only those decide
-    /// whether a redeem can help.
-    fn codex_limited(&self, account: &AccountState, timestamp: u64) -> bool {
-        account.quotas.iter().any(|(id, w)| {
-            matches!(id.as_str(), "codex-primary" | "codex-secondary")
-                && w.used(timestamp) >= account.threshold_percent
-        })
+    fn request_limit(account: &AccountState, group: Option<&str>) -> f64 {
+        if group.is_none() && !account.groups.is_empty() && account.shared_percent > 0.0 {
+            account.shared_percent.min(account.threshold_percent)
+        } else {
+            account.threshold_percent
+        }
+    }
+
+    fn blocking_quotas<'a>(
+        &'a self,
+        account: &'a AccountState,
+        model: &'a str,
+        limit: f64,
+        timestamp: u64,
+    ) -> impl Iterator<Item = (&'a String, &'a quota::Window)> + 'a {
+        account
+            .quotas
+            .iter()
+            .filter(move |(key, w)| self.relevant_quota(model, key) && w.used(timestamp) >= limit)
+    }
+
+    /// Reset credits clear only Codex windows. Do not spend one when another
+    /// quota, a hold, or a model restriction would still block this request.
+    fn resettable(
+        &self,
+        config: &Account,
+        account: &AccountState,
+        model: &str,
+        group: Option<&str>,
+        timestamp: u64,
+    ) -> bool {
+        let mut blocked = self
+            .blocking_quotas(
+                account,
+                model,
+                Self::request_limit(account, group),
+                timestamp,
+            )
+            .peekable();
+        config.auto_reset
+            && !account.disabled
+            && account.hold_until <= timestamp
+            && account.reset_credits.is_some_and(|count| count > 0)
+            && account
+                .unavailable_models
+                .get(model)
+                .is_none_or(|until| *until <= timestamp)
+            && blocked.peek().is_some()
+            && blocked.all(|(key, _)| matches!(key.as_str(), "codex-primary" | "codex-secondary"))
+    }
+
+    fn relevant_quota(&self, model: &str, key: &str) -> bool {
+        let limits = self.config.model_limits.get(model);
+        key == "codex-primary"
+            || key == "codex-secondary"
+            || key == format!("api:{model}:requests")
+            || key == format!("api:{model}:tokens")
+            || key == format!("api:{model}:project-tokens")
+            || limits.is_some_and(|ids| {
+                ids.iter().any(|id| {
+                    key == format!("{}-primary", quota::normalize(id))
+                        || key == format!("{}-secondary", quota::normalize(id))
+                })
+            })
     }
 
     pub fn mark_model_unavailable(&self, idx: usize, model: &str) {
@@ -644,7 +692,7 @@ impl Pool {
             if pinned.is_some_and(|pin| pin != idx)
                 || !match group {
                     Some(g) => account.groups.iter().any(|name| name == g),
-                    None => account.groups.is_empty(),
+                    None => account.groups.is_empty() || account.shared_percent > 0.0,
                 }
             {
                 continue;
@@ -791,45 +839,60 @@ impl Pool {
     }
 
     /// Earliest future time, in Unix seconds, when a hold, model restriction,
-    /// or exhausted quota window clears on any account.
-    pub fn reset_at(&self) -> Option<u64> {
+    /// or exhausted quota window clears on an account matching this request.
+    pub fn reset_at(&self, model: &str, group: Option<&str>, pinned: Option<usize>) -> Option<u64> {
+        let entries = self.accounts.read().unwrap();
         let state = self.state.lock().unwrap();
         let timestamp = now();
         state
             .accounts
             .iter()
-            .flat_map(|a| {
+            .enumerate()
+            .filter(|(idx, a)| {
+                !a.disabled && self.matches(&entries[*idx].account, *idx, model, group, pinned)
+            })
+            .flat_map(|(_, a)| {
                 std::iter::once(a.hold_until)
-                    .chain(a.unavailable_models.values().copied())
+                    .chain(a.unavailable_models.get(model).copied())
                     .chain(
-                        a.quotas
-                            .values()
-                            .filter(|w| w.used(timestamp) >= a.threshold_percent)
-                            .filter_map(|w| w.reset_at),
+                        self.blocking_quotas(a, model, Self::request_limit(a, group), timestamp)
+                            .filter_map(|(_, w)| w.reset_at),
                     )
             })
             .filter(|at| *at > timestamp)
             .min()
     }
 
-    fn limited(&self, account: &AccountState, timestamp: u64) -> bool {
-        account
-            .quotas
-            .values()
-            .any(|w| w.used(timestamp) >= account.threshold_percent)
-    }
-
     /// The earliest active hold on an enabled account that has quota left, with
     /// the reason that set it. A hold is the proxy waiting out a transient
     /// failure; it carries no upstream reset time.
-    pub fn active_hold(&self) -> Option<(u64, String)> {
+    pub fn active_hold(
+        &self,
+        model: &str,
+        group: Option<&str>,
+        pinned: Option<usize>,
+    ) -> Option<(u64, String)> {
+        let entries = self.accounts.read().unwrap();
         let state = self.state.lock().unwrap();
         let timestamp = now();
         state
             .accounts
             .iter()
-            .filter(|a| !a.disabled && a.hold_until > timestamp && !self.limited(a, timestamp))
-            .map(|a| {
+            .enumerate()
+            .filter(|(idx, a)| {
+                let config = &entries[*idx].account;
+                !a.disabled
+                    && a.hold_until > timestamp
+                    && self.matches(config, *idx, model, group, pinned)
+                    && a.unavailable_models
+                        .get(model)
+                        .is_none_or(|until| *until <= timestamp)
+                    && self
+                        .blocking_quotas(a, model, Self::request_limit(a, group), timestamp)
+                        .next()
+                        .is_none()
+            })
+            .map(|(_, a)| {
                 (
                     a.hold_until,
                     a.last_error.clone().unwrap_or_else(|| "hold".to_owned()),
@@ -838,27 +901,34 @@ impl Pool {
             .min_by_key(|(until, _)| *until)
     }
 
-    /// The earliest reset of a quota window that blocks an enabled account.
+    /// The earliest reset of a quota window that blocks this request.
     /// This is the only time the pool reports as a usage-limit reset.
-    pub fn quota_reset_at(&self) -> Option<u64> {
+    pub fn quota_reset_at(
+        &self,
+        model: &str,
+        group: Option<&str>,
+        pinned: Option<usize>,
+    ) -> Option<u64> {
+        let entries = self.accounts.read().unwrap();
         let state = self.state.lock().unwrap();
         let timestamp = now();
         state
             .accounts
             .iter()
-            .filter(|a| !a.disabled)
-            .flat_map(|a| {
-                a.quotas
-                    .values()
-                    .filter(|w| w.used(timestamp) >= a.threshold_percent)
-                    .filter_map(|w| w.reset_at)
+            .enumerate()
+            .filter(|(idx, a)| {
+                !a.disabled && self.matches(&entries[*idx].account, *idx, model, group, pinned)
+            })
+            .flat_map(|(_, a)| {
+                self.blocking_quotas(a, model, Self::request_limit(a, group), timestamp)
+                    .filter_map(|(_, w)| w.reset_at)
             })
             .filter(|at| *at > timestamp)
             .min()
     }
 
-    pub fn retry_seconds(&self) -> u64 {
-        self.reset_at()
+    pub fn retry_seconds(&self, model: &str, group: Option<&str>, pinned: Option<usize>) -> u64 {
+        self.reset_at(model, group, pinned)
             .map(|at| at.saturating_sub(now()))
             .unwrap_or(30)
             .max(1)

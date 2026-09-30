@@ -57,6 +57,10 @@ pub struct Account {
     pub disabled: bool,
     #[serde(default)]
     pub groups: Vec<String>,
+    /// Maximum quota usage available to ungrouped traffic on this grouped account.
+    /// Default: `0`, which keeps grouped accounts group-only.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub shared_percent: f64,
     #[serde(default)]
     pub models: Vec<String>,
     /// Per-account override of the top-level `threshold_percent`.
@@ -127,6 +131,10 @@ fn idle_timeout() -> u64 {
 }
 fn credential_ttl() -> u64 {
     240
+}
+
+fn is_zero(value: &f64) -> bool {
+    *value == 0.0
 }
 
 impl Account {
@@ -240,6 +248,14 @@ impl Config {
                     "account threshold_percent must be in (0, 100]"
                 );
             }
+            ensure!(
+                a.shared_percent.is_finite() && (0.0..=100.0).contains(&a.shared_percent),
+                "shared_percent must be in [0, 100]"
+            );
+            ensure!(
+                a.shared_percent == 0.0 || !a.groups.is_empty(),
+                "shared_percent requires at least one group"
+            );
             validate_url(a.base())?;
             if let Some(url) = a.usage() {
                 validate_url(url)?;

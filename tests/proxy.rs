@@ -86,8 +86,16 @@ fn config(base: &str) -> Config {
                 argv: vec!["python3".into(), "-c".into(), format!("import json; print(json.dumps({{'access_token':'test-upstream-{name}'}}))")],
                 cache_seconds: 240,
             },
-            priority: 0, disabled: false, groups: vec![], models: vec![], threshold_percent: None, auto_reset: false,
+            priority: 0, disabled: false, groups: vec![], shared_percent: 0.0, models: vec![], threshold_percent: None, auto_reset: false,
         }).collect(),
+    }
+}
+
+fn quota_window(used_percent: f64, reset_at: u64) -> Window {
+    Window {
+        used_percent,
+        reset_at: Some(reset_at),
+        window_minutes: None,
     }
 }
 
@@ -633,7 +641,62 @@ async fn held_credentials_report_the_hold_not_a_usage_limit() {
 }
 
 #[tokio::test]
-async fn held_rate_limit_reports_transient_429_without_reset_time() {
+async fn shared_cap_reports_quota_reset_when_a_hold_is_active() {
+    let mock = mock(|_, _, _| Json(completed("resp_test")).into_response());
+    let source = upstream(&mock).await;
+    let mut cfg = config(&source.url);
+    cfg.accounts.truncate(1);
+    cfg.accounts[0].groups = vec!["daybreak-blue".into()];
+    cfg.accounts[0].shared_percent = 20.0;
+    cfg.accounts[0].credential = Credential::Command {
+        argv: vec![
+            "python3".into(),
+            "-c".into(),
+            "import sys; sys.exit(1)".into(),
+        ],
+        cache_seconds: 240,
+    };
+    let (pool, server) = gateway(cfg).await;
+    let first = post(&server)
+        .json(&json!({"model":"test"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(first.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let reset_at = now() + 3600;
+    pool.update_quotas(
+        0,
+        BTreeMap::from([
+            ("codex-primary".into(), quota_window(20.0, reset_at)),
+            ("api:other:requests".into(), quota_window(20.0, now() + 60)),
+        ]),
+    );
+
+    let second = post(&server)
+        .json(&json!({"model":"test"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
+    let body: Value = second.json().await.unwrap();
+    assert_eq!(body["error"]["type"], "usage_limit_reached");
+    assert_eq!(body["error"]["code"], "pool_exhausted");
+    assert_eq!(body["error"]["resets_at"], reset_at);
+
+    let unrelated = post(&server)
+        .header("x-tcx-group", "other")
+        .json(&json!({"model":"test"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(unrelated.status(), StatusCode::TOO_MANY_REQUESTS);
+    let body: Value = unrelated.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "pool_exhausted");
+    assert!(body["error"].get("resets_at").is_none());
+}
+
+#[tokio::test]
+async fn held_rate_limit_reports_retryable_503_without_reset_time() {
     let mock = mock(|_, _, _| {
         (
             StatusCode::TOO_MANY_REQUESTS,
@@ -661,7 +724,7 @@ async fn held_rate_limit_reports_transient_429_without_reset_time() {
             .send()
             .await
             .unwrap();
-        assert_eq!(response.status(), 429, "attempt {attempt}");
+        assert_eq!(response.status(), 503, "attempt {attempt}");
         let retry_after: u64 = response.headers()["retry-after"]
             .to_str()
             .unwrap()
@@ -713,7 +776,7 @@ async fn held_overload_reports_retryable_capacity_error() {
         .send()
         .await
         .unwrap();
-    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     let retry_after: u64 = response.headers()["retry-after"]
         .to_str()
         .unwrap()
@@ -1003,6 +1066,63 @@ fn selection_obeys_priority_groups_models_quota_and_expiry() {
     );
 }
 
+#[test]
+fn shared_cap_reserves_remaining_quota_for_group() {
+    let mut cfg = config("http://127.0.0.1:1");
+    cfg.accounts.truncate(1);
+    cfg.accounts[0].groups = vec!["reserved".into()];
+    cfg.accounts[0].shared_percent = 20.0;
+    let pool = Pool::new(cfg).unwrap();
+    for used in [0.0, 19.9, 20.0, 80.0, 95.0, 100.0] {
+        pool.update_quotas(
+            0,
+            [("codex-primary".into(), quota_window(used, now() + 100))].into(),
+        );
+        assert_eq!(
+            pool.select("test", None, None, None, &[]).is_some(),
+            used < 20.0
+        );
+        assert_eq!(
+            pool.select("test", Some("reserved"), None, None, &[])
+                .is_some(),
+            used < 95.0
+        );
+        assert!(
+            pool.select("test", Some("other"), None, None, &[])
+                .is_none()
+        );
+    }
+    pool.update_quotas(
+        0,
+        [("codex-primary".into(), quota_window(100.0, now() - 1))].into(),
+    );
+    assert!(pool.has_eligible("test", None, None));
+}
+
+#[test]
+fn shared_cap_reload_applies_zero_full_and_partial_limits() {
+    let mut cfg = config("http://127.0.0.1:1");
+    cfg.accounts.truncate(1);
+    cfg.accounts[0].groups = vec!["reserved".into()];
+    cfg.accounts[0].threshold_percent = Some(90.0);
+    let pool = Pool::new(cfg.clone()).unwrap();
+    for (shared, used, eligible) in [
+        (0.0, 0.0, false),
+        (100.0, 80.0, true),
+        (100.0, 90.0, false),
+        (20.0, 20.0, false),
+    ] {
+        cfg.accounts[0].shared_percent = shared;
+        pool.reload(cfg.clone()).unwrap();
+        pool.update_quotas(
+            0,
+            [("codex-primary".into(), quota_window(used, now() + 100))].into(),
+        );
+        assert_eq!(pool.has_eligible("test", None, None), eligible);
+        assert_eq!(pool.snapshot().accounts[0].shared_percent, shared);
+    }
+}
+
 #[tokio::test]
 async fn concurrent_401_responses_coalesce_credential_refresh() {
     let directory = tempfile::tempdir().unwrap();
@@ -1047,6 +1167,13 @@ fn invalid_configuration_is_rejected() {
     assert!(cfg.validate().is_err());
     cfg = config("https://example.com");
     cfg.accounts[1].name = "a".into();
+    assert!(cfg.validate().is_err());
+    cfg = config("https://example.com");
+    cfg.accounts[0].shared_percent = 20.0;
+    assert!(cfg.validate().is_err());
+    cfg.accounts[0].groups = vec!["daybreak-blue".into()];
+    assert!(cfg.validate().is_ok());
+    cfg.accounts[0].shared_percent = 101.0;
     assert!(cfg.validate().is_err());
 }
 
