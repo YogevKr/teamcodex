@@ -73,6 +73,13 @@ enum Commands {
         #[arg(long, short = 'y')]
         yes: bool,
     },
+    /// Show an account's credit auto top-up setting through the running server.
+    TopUp {
+        name: String,
+        /// Turn auto top-up off.
+        #[arg(long)]
+        disable: bool,
+    },
     /// Print a Codex provider configuration without changing existing files.
     CodexConfig,
     /// Print a macOS LaunchAgent plist that runs the headless server at login.
@@ -267,6 +274,9 @@ async fn main() -> Result<()> {
         } => {
             return reset_account(&config, &name, credit.as_deref(), list, yes).await;
         }
+        Commands::TopUp { name, disable } => {
+            return top_up(&config, &name, disable).await;
+        }
         Commands::Run { group, args } => {
             return run_codex(&config, group.as_deref(), args).await;
         }
@@ -274,6 +284,38 @@ async fn main() -> Result<()> {
             unreachable!()
         }
     }
+    Ok(())
+}
+
+/// Show an account's credit auto top-up setting, and turn it off on request.
+async fn top_up(config: &Config, name: &str, disable: bool) -> Result<()> {
+    ensure!(
+        config.accounts.iter().any(|a| a.name == name),
+        "unknown account"
+    );
+    let client = reqwest::Client::builder().no_proxy().build()?;
+    let url = format!("http://{}/accounts/{name}/auto-top-up", config.listen);
+    let request = if disable {
+        client.post(format!("{url}/disable"))
+    } else {
+        client.get(url)
+    };
+    let response = request
+        .bearer_auth(config.client_token()?)
+        .timeout(std::time::Duration::from_secs(40))
+        .send()
+        .await
+        .context("cannot reach the proxy; is tcx server running?")?;
+    let status = response.status();
+    let value: serde_json::Value = response.json().await?;
+    ensure!(
+        status.is_success(),
+        "auto top-up request failed: {}",
+        value["error"]["message"]
+            .as_str()
+            .unwrap_or("unknown error")
+    );
+    print!("{}", teamcodex::topup::render(name, &value));
     Ok(())
 }
 

@@ -70,6 +70,11 @@ pub struct Account {
     /// the only limited candidate for a request. Default: `false`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub auto_reset: bool,
+    /// Select this account after its Codex usage limit while it has a credit
+    /// balance. The upstream then bills the credits. The pool uses it only
+    /// when no account has plan quota left. Default: `false`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub spend_credits: bool,
 }
 
 #[derive(Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
@@ -158,6 +163,18 @@ impl Account {
             (self.kind == Kind::Chatgpt && self.base_url.is_none())
                 .then_some("https://chatgpt.com/backend-api/wham/usage")
         })
+    }
+
+    /// The credit auto top-up endpoint of the backend that serves the usage
+    /// endpoint: `.../backend-api/wham/usage` maps to
+    /// `.../backend-api/subscriptions/auto_top_up`.
+    pub fn auto_top_up(&self) -> Option<String> {
+        if self.kind != Kind::Chatgpt {
+            return None;
+        }
+        let base = self.usage()?.strip_suffix("/usage")?;
+        let base = base.strip_suffix("/wham").unwrap_or(base);
+        Some(format!("{base}/subscriptions/auto_top_up"))
     }
 
     /// The usage-limit reset credit endpoint. It lives next to the usage
@@ -255,6 +272,10 @@ impl Config {
             ensure!(
                 a.shared_percent == 0.0 || !a.groups.is_empty(),
                 "shared_percent requires at least one group"
+            );
+            ensure!(
+                !a.spend_credits || a.kind == Kind::Chatgpt,
+                "spend_credits requires a ChatGPT account"
             );
             validate_url(a.base())?;
             if let Some(url) = a.usage() {

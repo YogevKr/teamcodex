@@ -197,6 +197,63 @@ pub fn usage(value: &Value, timestamp: u64) -> Quotas {
     output
 }
 
+/// The account's ChatGPT credit balance. After a plan usage limit, the
+/// upstream serves Codex requests from this balance.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+pub struct Credits {
+    pub has_credits: bool,
+    pub unlimited: bool,
+    /// Remaining balance. `None` when the upstream does not report it.
+    pub balance: Option<f64>,
+}
+
+impl Credits {
+    /// True when the upstream can serve a request from credits.
+    pub fn available(&self) -> bool {
+        self.unlimited || (self.has_credits && self.balance.is_none_or(|b| b > 0.0))
+    }
+}
+
+fn balance(value: &Value) -> Option<f64> {
+    value
+        .as_f64()
+        .or_else(|| value.as_str().and_then(|v| v.trim().parse().ok()))
+        .filter(|b: &f64| b.is_finite())
+}
+
+/// The credit balance of a usage payload or a `codex.rate_limits` stream event.
+pub fn credits(value: &Value) -> Option<Credits> {
+    let credits = value.get("credits")?;
+    Some(Credits {
+        has_credits: credits.get("has_credits")?.as_bool()?,
+        unlimited: credits
+            .get("unlimited")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        balance: credits.get("balance").and_then(balance),
+    })
+}
+
+/// The credit balance from `x-codex-credits-*` response headers.
+pub fn credit_headers(headers: &HeaderMap) -> Option<Credits> {
+    let get = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
+    let flag = |name: &str| {
+        let raw = get(name)?.trim();
+        if raw.eq_ignore_ascii_case("true") || raw == "1" {
+            Some(true)
+        } else if raw.eq_ignore_ascii_case("false") || raw == "0" {
+            Some(false)
+        } else {
+            None
+        }
+    };
+    Some(Credits {
+        has_credits: flag("x-codex-credits-has-credits")?,
+        unlimited: flag("x-codex-credits-unlimited").unwrap_or(false),
+        balance: get("x-codex-credits-balance").and_then(|v| balance(&Value::from(v))),
+    })
+}
+
 /// The number of usage-limit reset credits the account can redeem, when the
 /// usage or credit-list payload reports it.
 pub fn reset_credits(value: &Value) -> Option<i64> {
@@ -337,6 +394,45 @@ mod tests {
         assert_eq!(q["codex-primary"].window_minutes, Some(10080));
         assert_eq!(q["codex-spark-secondary"].reset_at, Some(110));
     }
+    #[test]
+    fn reads_credit_balance_from_usage_events_and_headers() {
+        let usage = json!({"rate_limit":{}, "credits":{"has_credits":true,"unlimited":false,
+            "balance":"12.5","approx_local_messages":[10,20]}});
+        let parsed = credits(&usage).unwrap();
+        assert_eq!(parsed.balance, Some(12.5));
+        assert!(parsed.available());
+        let event = json!({"type":"codex.rate_limits","credits":{"has_credits":true,"unlimited":false,"balance":0}});
+        assert!(!credits(&event).unwrap().available());
+        let hidden = json!({"credits":{"has_credits":true,"unlimited":false,"balance":null}});
+        assert!(credits(&hidden).unwrap().available());
+        let unlimited = json!({"credits":{"has_credits":false,"unlimited":true}});
+        assert!(credits(&unlimited).unwrap().available());
+        let none = json!({"credits":{"has_credits":false,"unlimited":false,"balance":"0"}});
+        assert!(!credits(&none).unwrap().available());
+        assert_eq!(credits(&json!({"rate_limit":{}})), None);
+        assert_eq!(credits(&json!({"credits":null})), None);
+
+        let mut h = HeaderMap::new();
+        assert_eq!(credit_headers(&h), None);
+        h.insert("x-codex-credits-has-credits", "yes".parse().unwrap());
+        assert_eq!(
+            credit_headers(&h),
+            None,
+            "Codex accepts only true/false/1/0"
+        );
+        h.insert("x-codex-credits-has-credits", "True".parse().unwrap());
+        h.insert("x-codex-credits-unlimited", "false".parse().unwrap());
+        h.insert("x-codex-credits-balance", " 40 ".parse().unwrap());
+        assert_eq!(
+            credit_headers(&h),
+            Some(Credits {
+                has_credits: true,
+                unlimited: false,
+                balance: Some(40.0)
+            })
+        );
+    }
+
     #[test]
     fn reads_headers_and_rejects_nan() {
         let mut h = HeaderMap::new();

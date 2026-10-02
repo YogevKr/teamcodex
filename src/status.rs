@@ -4,25 +4,62 @@
 //! reads the same JSON the `/status` route serves, so it never needs the
 //! server's in-memory types.
 
-use crate::quota::{Quotas, Window};
+use crate::quota::{Credits, Quotas, Window};
 use serde_json::Value;
 
-/// Describe an account for the table and the terminal display.
+/// Describe an account for the table and the terminal display. `spending` is
+/// true when the account opted in to spend credits, auto top-up is off, and
+/// it has a balance; a limited account then reads `credits` while only Codex
+/// windows block it.
 pub fn state_label(
     disabled: bool,
     hold_until: u64,
     quotas: &Quotas,
     threshold: f64,
+    spending: bool,
     now: u64,
 ) -> &'static str {
+    let over: Vec<&String> = quotas
+        .iter()
+        .filter(|(_, w)| w.used(now) >= threshold)
+        .map(|(id, _)| id)
+        .collect();
     if disabled {
         "disabled"
     } else if hold_until > now {
         "waiting"
-    } else if quotas.values().any(|w| w.used(now) >= threshold) {
-        "limited"
-    } else {
+    } else if over.is_empty() {
         "ready"
+    } else if spending
+        && over
+            .iter()
+            .all(|id| matches!(id.as_str(), "codex-primary" | "codex-secondary"))
+    {
+        "credits"
+    } else {
+        "limited"
+    }
+}
+
+/// `40`, `12.5`, `unlimited`, `0`, or `yes` when the balance is hidden;
+/// `-` before the upstream reports credits. ` spend` marks an opted-in account.
+fn credits_cell(credits: Option<&Credits>, spend: bool) -> String {
+    let balance = match credits {
+        None => "-".to_owned(),
+        Some(c) if c.unlimited => "unlimited".to_owned(),
+        Some(c) if !c.has_credits => "0".to_owned(),
+        Some(Credits {
+            balance: Some(b), ..
+        }) => {
+            let text = format!("{b:.2}");
+            text.trim_end_matches('0').trim_end_matches('.').to_owned()
+        }
+        Some(_) => "yes".to_owned(),
+    };
+    if spend {
+        format!("{balance} spend")
+    } else {
+        balance
     }
 }
 
@@ -119,6 +156,14 @@ fn account_row(account: &Value, default_threshold: f64, now: u64) -> Vec<String>
         .unwrap_or_default();
     let disabled = account["disabled"].as_bool().unwrap_or(false);
     let hold_until = account["hold_until"].as_u64().unwrap_or(0);
+    let credits: Option<Credits> = account
+        .get("credits")
+        .cloned()
+        .and_then(|v| serde_json::from_value(v).ok());
+    let spend = account["spend_credits"].as_bool().unwrap_or(false);
+    let top_up = account.get("auto_top_up").and_then(Value::as_bool);
+    let spending =
+        spend && top_up == Some(false) && credits.as_ref().is_some_and(Credits::available);
     let probe = match account.get("last_probe_ok").and_then(Value::as_bool) {
         Some(true) => "ok",
         Some(false) => "fail",
@@ -139,13 +184,23 @@ fn account_row(account: &Value, default_threshold: f64, now: u64) -> Vec<String>
     if hold_until > now {
         note.push(format!("hold {}", countdown(hold_until, now)));
     }
+    match top_up {
+        Some(true) => note.push("auto top-up ON".to_owned()),
+        None if spend => note.push("auto top-up unknown".to_owned()),
+        _ => {}
+    }
+    let credit_calls = account["credit_requests"].as_u64().unwrap_or(0);
+    if credit_calls > 0 {
+        note.push(format!("credit calls {credit_calls}"));
+    }
     vec![
         account["name"].as_str().unwrap_or("?").to_owned(),
-        state_label(disabled, hold_until, &quotas, threshold, now).to_owned(),
+        state_label(disabled, hold_until, &quotas, threshold, spending, now).to_owned(),
         format!("{threshold:.0}%"),
         remaining(&quotas, Kind::Short, now),
         remaining(&quotas, Kind::Weekly, now),
         other_limits(&quotas, threshold, now),
+        credits_cell(credits.as_ref(), spend),
         match account.get("reset_credits").and_then(Value::as_i64) {
             Some(count) => count.to_string(),
             None => "-".to_owned(),
@@ -162,13 +217,14 @@ fn account_row(account: &Value, default_threshold: f64, now: u64) -> Vec<String>
     ]
 }
 
-const HEADER: [&str; 12] = [
+const HEADER: [&str; 13] = [
     "ACCOUNT",
     "STATE",
     "LIMIT AT",
     "5H LEFT",
     "WEEK LEFT",
     "OTHER LIMITS",
+    "CREDITS",
     "RESETS",
     "ACTIVE",
     "CALLS",
@@ -218,17 +274,23 @@ pub fn render(status: &Value, threshold: f64, now: u64) -> String {
         })
         .count();
     let ready = rows.iter().filter(|r| r[1] == "ready").count() - group_only;
+    let on_credits = rows.iter().filter(|r| r[1] == "credits").count();
     let routing = match status["routing_healthy"].as_bool() {
         Some(true) => "ok",
         Some(false) => "UNHEALTHY",
         None => "-",
     };
     let mut out = format!(
-        "accounts {}  ready {}{}  threshold {:.0}%  routing {}\n",
+        "accounts {}  ready {}{}{}  threshold {:.0}%  routing {}\n",
         rows.len(),
         ready,
         if group_only > 0 {
             format!(" (+{group_only} group-only)")
+        } else {
+            String::new()
+        },
+        if on_credits > 0 {
+            format!(" (+{on_credits} on credits)")
         } else {
             String::new()
         },
@@ -298,16 +360,80 @@ mod tests {
         assert!(personal.contains("  -  "), "no short window: {personal}");
         assert!(personal.contains("4% (+1d03h)"), "{personal}");
         assert_eq!(
-            personal.split_whitespace().nth(7),
+            personal.split_whitespace().nth(8),
             Some("2"),
             "reset credits: {personal}"
         );
         assert!(personal.contains("  ok  "), "{personal}");
         let team = row(&text, "team");
         assert_eq!(
-            team.split_whitespace().nth(7),
+            team.split_whitespace().nth(8),
             Some("-"),
             "unknown credits: {team}"
+        );
+    }
+
+    #[test]
+    fn credit_balance_and_spending_state() {
+        let mut status = status();
+        let personal = row(&render(&status, 95.0, 1000), "personal").to_owned();
+        assert_eq!(personal.split_whitespace().nth(7), Some("-"), "{personal}");
+
+        status["accounts"][0]["credits"] =
+            json!({"has_credits": true, "unlimited": false, "balance": 12.5});
+        let text = render(&status, 95.0, 1000);
+        let personal = row(&text, "personal");
+        assert!(personal.contains("limited"), "no opt-in: {personal}");
+        assert_eq!(
+            personal.split_whitespace().nth(7),
+            Some("12.5"),
+            "{personal}"
+        );
+
+        status["accounts"][0]["spend_credits"] = json!(true);
+        status["accounts"][0]["credit_requests"] = json!(3);
+        let unknown = render(&status, 95.0, 1000);
+        let personal = row(&unknown, "personal");
+        assert!(personal.contains("limited"), "top-up unread: {personal}");
+        assert!(personal.contains("auto top-up unknown"), "{personal}");
+        status["accounts"][0]["auto_top_up"] = json!(true);
+        let on = render(&status, 95.0, 1000);
+        let personal = row(&on, "personal");
+        assert!(personal.contains("limited"), "top-up on: {personal}");
+        assert!(personal.contains("auto top-up ON"), "{personal}");
+        status["accounts"][0]["auto_top_up"] = json!(false);
+        let text = render(&status, 95.0, 1000);
+        assert!(
+            text.starts_with("accounts 3  ready 0 (+1 on credits)  threshold"),
+            "{text}"
+        );
+        let personal = row(&text, "personal");
+        assert!(personal.contains("credits"), "{personal}");
+        assert!(personal.contains("  12.5 spend  "), "{personal}");
+        assert!(personal.ends_with("credit calls 3"), "{personal}");
+
+        // An empty balance or another blocking window keeps the account limited.
+        status["accounts"][0]["credits"] =
+            json!({"has_credits": false, "unlimited": false, "balance": 0});
+        let personal = row(&render(&status, 95.0, 1000), "personal").to_owned();
+        assert!(personal.contains("limited"), "{personal}");
+        assert!(personal.contains("  0 spend  "), "{personal}");
+        status["accounts"][0]["credits"] = json!({"has_credits": false, "unlimited": true});
+        status["accounts"][0]["quotas"]["gpt-5.3-codex-spark-primary"]["used_percent"] =
+            json!(99.0);
+        let personal = row(&render(&status, 95.0, 1000), "personal").to_owned();
+        assert!(personal.contains("limited"), "{personal}");
+        assert!(personal.contains("  unlimited spend  "), "{personal}");
+        assert_eq!(
+            credits_cell(
+                Some(&Credits {
+                    has_credits: true,
+                    unlimited: false,
+                    balance: None
+                }),
+                false
+            ),
+            "yes"
         );
     }
 

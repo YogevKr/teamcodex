@@ -29,6 +29,11 @@ pub fn draw(frame: &mut Frame, pool: &Pool) {
             a.hold_until,
             &a.quotas,
             a.threshold_percent,
+            a.spend_credits
+                && a.auto_top_up == Some(false)
+                && a.credits
+                    .as_ref()
+                    .is_some_and(crate::quota::Credits::available),
             snapshot.at,
         );
         let quota = if a.quotas.is_empty() {

@@ -160,6 +160,7 @@ pub async fn register(
             models: Vec::new(),
             threshold_percent: None,
             auto_reset: false,
+            spend_credits: false,
         });
     }
     if config.client_token_file.is_none() {

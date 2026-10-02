@@ -24,6 +24,11 @@ pub fn credential_failure(reason: &str) -> bool {
     )
 }
 
+/// The Codex plan windows. Reset credits and credit balances lift only these.
+fn codex_window(key: &str) -> bool {
+    matches!(key, "codex-primary" | "codex-secondary")
+}
+
 const MODEL_RETRY_SECONDS: u64 = 300;
 const MODEL_CACHE_LIMIT: usize = 256;
 
@@ -62,6 +67,16 @@ pub struct AccountState {
     pub last_reset: Option<u64>,
     /// No automatic redeem before this Unix time.
     pub reset_retry_at: u64,
+    /// The account opted in to spend credits after its Codex usage limit.
+    pub spend_credits: bool,
+    /// Credit balance from the last probe or response. `None` until the
+    /// upstream reports one.
+    pub credits: Option<quota::Credits>,
+    /// Requests routed to this account to spend credits.
+    pub credit_requests: u64,
+    /// Credit auto top-up from the last probe: `Some(false)` when off.
+    /// `None` until a probe reads the setting. Credits are spent only when off.
+    pub auto_top_up: Option<bool>,
     #[serde(skip)]
     pub selected: u64,
 }
@@ -184,6 +199,7 @@ impl Pool {
                 groups: e.account.groups.clone(),
                 shared_percent: e.account.shared_percent,
                 threshold_percent: e.account.threshold(config.threshold_percent),
+                spend_credits: e.account.spend_credits,
                 ..Default::default()
             })
             .collect();
@@ -282,6 +298,7 @@ impl Pool {
                     groups: account.groups.clone(),
                     shared_percent: account.shared_percent,
                     threshold_percent: account.threshold(self.config.threshold_percent),
+                    spend_credits: account.spend_credits,
                     ..Default::default()
                 });
                 entries.push(Entry::new(account)?);
@@ -300,6 +317,8 @@ impl Pool {
                 entry.auth = Arc::new(Auth::default());
                 entry.binding = binding;
                 live.quotas.clear();
+                live.credits = None;
+                live.auto_top_up = None;
                 live.unavailable_models.clear();
                 live.hold_until = 0;
             }
@@ -312,6 +331,7 @@ impl Pool {
             live.threshold_percent = account.threshold(self.config.threshold_percent);
             live.groups = account.groups.clone();
             live.shared_percent = account.shared_percent;
+            live.spend_credits = account.spend_credits;
             entry.account = account;
             summary.updated.push(entry.account.name.clone());
         }
@@ -383,24 +403,31 @@ impl Pool {
         let session =
             session.map(|key| affinity::hash(&serde_json::to_vec(&(model, group, key)).unwrap()));
         let timestamp = now();
-        let candidates: Vec<usize> = state
-            .accounts
-            .iter()
-            .enumerate()
-            .filter_map(|(idx, account)| {
-                let eligible = !tried.contains(&idx)
-                    && self.eligible(
-                        &entries[idx].account,
-                        idx,
-                        account,
-                        model,
-                        group,
-                        pinned,
-                        timestamp,
-                    );
-                eligible.then_some(idx)
-            })
-            .collect();
+        let collect = |accept: &dyn Fn(&Account, usize, &AccountState) -> bool| -> Vec<usize> {
+            state
+                .accounts
+                .iter()
+                .enumerate()
+                .filter(|(idx, account)| {
+                    !tried.contains(idx) && accept(&entries[*idx].account, *idx, account)
+                })
+                .map(|(idx, _)| idx)
+                .collect()
+        };
+        let mut candidates = collect(&|config, idx, account| {
+            self.eligible(config, idx, account, model, group, pinned, timestamp)
+        });
+        // Plan quota first. Credits cost money, so they serve a request only
+        // when no account has plan quota left. An account with quota that
+        // waits out a transient hold recovers by itself; the pool waits too.
+        let credit = candidates.is_empty()
+            && !self.transient_hold(&entries, &state, model, group, pinned, timestamp);
+        if credit {
+            candidates = collect(&|config, idx, account| {
+                account.hold_until <= timestamp
+                    && self.on_credits(config, idx, account, model, group, pinned, timestamp)
+            });
+        }
         // An eligible established session stays on its account, including after
         // a higher-priority account recovers. Priority selects new sessions.
         let affinity = session
@@ -429,6 +456,9 @@ impl Pool {
         let sequence = state.sequence;
         state.accounts[idx].in_flight += 1;
         state.accounts[idx].selected = sequence;
+        if credit {
+            state.accounts[idx].credit_requests += 1;
+        }
         Some(Lease {
             pool: self.clone(),
             idx,
@@ -439,6 +469,18 @@ impl Pool {
         self.state.lock().unwrap().accounts[idx]
             .quotas
             .extend(quotas);
+    }
+
+    pub fn set_credits(&self, idx: usize, credits: Option<quota::Credits>) {
+        if let Some(credits) = credits {
+            self.state.lock().unwrap().accounts[idx].credits = Some(credits);
+        }
+    }
+
+    pub fn set_auto_top_up(&self, idx: usize, enabled: Option<bool>) {
+        if let Some(enabled) = enabled {
+            self.state.lock().unwrap().accounts[idx].auto_top_up = Some(enabled);
+        }
     }
 
     pub fn set_reset_credits(&self, idx: usize, count: Option<i64>) {
@@ -458,7 +500,7 @@ impl Pool {
             *count = (*count - 1).max(0);
         }
         for (id, window) in account.quotas.iter_mut() {
-            if matches!(id.as_str(), "codex-primary" | "codex-secondary") {
+            if codex_window(id) {
                 window.used_percent = 0.0;
             }
         }
@@ -542,6 +584,107 @@ impl Pool {
                 .get(model)
                 .is_none_or(|until| *until <= timestamp)
             && self.matches(config, idx, model, group, pinned)
+    }
+
+    /// Credit tier rule: the account opted in, auto top-up is known to be off,
+    /// it holds a credit balance, and only its Codex plan windows block it.
+    /// Credits do not lift another quota window or a model restriction. The
+    /// caller checks holds.
+    #[allow(clippy::too_many_arguments)]
+    fn on_credits(
+        &self,
+        config: &Account,
+        idx: usize,
+        account: &AccountState,
+        model: &str,
+        group: Option<&str>,
+        pinned: Option<usize>,
+        timestamp: u64,
+    ) -> bool {
+        config.spend_credits
+            && account.auto_top_up == Some(false)
+            && account
+                .credits
+                .as_ref()
+                .is_some_and(quota::Credits::available)
+            && !account.disabled
+            && account
+                .unavailable_models
+                .get(model)
+                .is_none_or(|until| *until <= timestamp)
+            && self.matches(config, idx, model, group, pinned)
+            && self
+                .blocking_quotas(
+                    account,
+                    model,
+                    Self::request_limit(account, group),
+                    timestamp,
+                )
+                .all(|(key, _)| codex_window(key))
+            // A shared cap below the threshold keeps its reserve for the group.
+            && self
+                .blocking_quotas(account, model, account.threshold_percent, timestamp)
+                .next()
+                .is_some()
+    }
+
+    /// An enabled account that matches the request and has quota left, but
+    /// waits out a hold.
+    #[allow(clippy::too_many_arguments)]
+    fn held_with_quota(
+        &self,
+        config: &Account,
+        idx: usize,
+        account: &AccountState,
+        model: &str,
+        group: Option<&str>,
+        pinned: Option<usize>,
+        timestamp: u64,
+    ) -> bool {
+        !account.disabled
+            && account.hold_until > timestamp
+            && self.matches(config, idx, model, group, pinned)
+            && account
+                .unavailable_models
+                .get(model)
+                .is_none_or(|until| *until <= timestamp)
+            && self
+                .blocking_quotas(
+                    account,
+                    model,
+                    Self::request_limit(account, group),
+                    timestamp,
+                )
+                .next()
+                .is_none()
+    }
+
+    /// True when an account with quota left waits out a rate limit, overload,
+    /// or connection hold. A failed credential does not recover by itself, so
+    /// its hold does not count.
+    fn transient_hold(
+        &self,
+        entries: &[Entry],
+        state: &State,
+        model: &str,
+        group: Option<&str>,
+        pinned: Option<usize>,
+        timestamp: u64,
+    ) -> bool {
+        state.accounts.iter().enumerate().any(|(idx, account)| {
+            self.held_with_quota(
+                &entries[idx].account,
+                idx,
+                account,
+                model,
+                group,
+                pinned,
+                timestamp,
+            ) && !account
+                .last_error
+                .as_deref()
+                .is_some_and(credential_failure)
+        })
     }
 
     /// The limited account that an automatic reset should recover for this
@@ -636,7 +779,7 @@ impl Pool {
                 .get(model)
                 .is_none_or(|until| *until <= timestamp)
             && blocked.peek().is_some()
-            && blocked.all(|(key, _)| matches!(key.as_str(), "codex-primary" | "codex-secondary"))
+            && blocked.all(|(key, _)| codex_window(key))
     }
 
     fn relevant_quota(&self, model: &str, key: &str) -> bool {
@@ -863,9 +1006,9 @@ impl Pool {
             .min()
     }
 
-    /// The earliest active hold on an enabled account that has quota left, with
-    /// the reason that set it. A hold is the proxy waiting out a transient
-    /// failure; it carries no upstream reset time.
+    /// The earliest active hold on an enabled account that has quota or
+    /// spendable credits left, with the reason that set it. A hold is the
+    /// proxy waiting out a transient failure; it carries no upstream reset time.
     pub fn active_hold(
         &self,
         model: &str,
@@ -881,16 +1024,9 @@ impl Pool {
             .enumerate()
             .filter(|(idx, a)| {
                 let config = &entries[*idx].account;
-                !a.disabled
-                    && a.hold_until > timestamp
-                    && self.matches(config, *idx, model, group, pinned)
-                    && a.unavailable_models
-                        .get(model)
-                        .is_none_or(|until| *until <= timestamp)
-                    && self
-                        .blocking_quotas(a, model, Self::request_limit(a, group), timestamp)
-                        .next()
-                        .is_none()
+                self.held_with_quota(config, *idx, a, model, group, pinned, timestamp)
+                    || (a.hold_until > timestamp
+                        && self.on_credits(config, *idx, a, model, group, pinned, timestamp))
             })
             .map(|(_, a)| {
                 (

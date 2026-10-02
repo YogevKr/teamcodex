@@ -4,6 +4,7 @@ use crate::{
     pool::{Lease, Pool},
     quota, reset,
     sse::Parser,
+    topup,
 };
 use anyhow::Context;
 use axum::{
@@ -210,6 +211,36 @@ async fn handle(State(app): State<App>, request: Request) -> Response {
             Json(json!({"enabled":enabled})).into_response()
         } else {
             error(StatusCode::NOT_FOUND, "account", "Unknown account")
+        };
+    }
+    if let Some((name, disable)) = path.strip_prefix("/accounts/").and_then(|p| {
+        p.strip_suffix("/auto-top-up")
+            .map(|n| (n, false))
+            .or_else(|| p.strip_suffix("/auto-top-up/disable").map(|n| (n, true)))
+    }) {
+        let expected = if disable { Method::POST } else { Method::GET };
+        if parts.method != expected {
+            return error(
+                StatusCode::METHOD_NOT_ALLOWED,
+                "method",
+                if disable { "Use POST" } else { "Use GET" },
+            );
+        }
+        let Some(idx) = app.pool.index(name) else {
+            return error(StatusCode::NOT_FOUND, "account", "Unknown account");
+        };
+        let result = if disable {
+            topup::disable(&app.pool, idx).await
+        } else {
+            topup::settings(&app.pool, idx).await
+        };
+        return match result {
+            Ok(value) => Json(value).into_response(),
+            Err(failure) => error(
+                StatusCode::BAD_GATEWAY,
+                "auto_top_up_failed",
+                &failure.to_string(),
+            ),
         };
     }
     if let Some(name) = path
@@ -450,6 +481,8 @@ async fn handle(State(app): State<App>, request: Request) -> Response {
         let status = upstream.status();
         app.pool
             .update_quotas(idx, quota::headers(upstream.headers()));
+        app.pool
+            .set_credits(idx, quota::credit_headers(upstream.headers()));
         if account.kind == crate::config::Kind::Api {
             app.pool
                 .update_quotas(idx, quota::api_headers(upstream.headers(), model, now()));
@@ -888,6 +921,11 @@ impl Observation {
         self.lease
             .pool
             .update_quotas(self.lease.idx, quota::usage(event, now()));
+        if event.get("type").and_then(Value::as_str) == Some("codex.rate_limits") {
+            self.lease
+                .pool
+                .set_credits(self.lease.idx, quota::credits(event));
+        }
         match event.get("type").and_then(Value::as_str) {
             Some("response.completed") => self.finish("complete", event.get("response")),
             Some("response.failed" | "response.incomplete" | "error") => {
@@ -1062,8 +1100,8 @@ pub async fn read_bounded(
     Ok(bytes)
 }
 
-/// Read one account's usage endpoint and record its quota windows and reset
-/// credit count. Accounts without a usage endpoint are skipped as an error.
+/// Read one account's usage endpoint and record its quota windows, credit
+/// balance, and reset credit count. Accounts without a usage endpoint are skipped as an error.
 pub async fn probe_account(pool: &Arc<Pool>, idx: usize) -> anyhow::Result<()> {
     let (account, auth) = pool.entry(idx).context("unknown account")?;
     let account = &account;
@@ -1091,7 +1129,13 @@ pub async fn probe_account(pool: &Arc<Pool>, idx: usize) -> anyhow::Result<()> {
         let bytes = read_bounded(response, 1024 * 1024, 15).await?;
         let value: Value = serde_json::from_slice(&bytes)?;
         pool.update_quotas(idx, quota::usage(&value, now()));
+        pool.set_credits(idx, quota::credits(&value));
         pool.set_reset_credits(idx, quota::reset_credits(&value));
+        // A failed read keeps the last known state. Credits are never spent
+        // before a read reports auto top-up off.
+        if account.auto_top_up().is_some() {
+            let _ = topup::settings(pool, idx).await;
+        }
         Ok::<(), anyhow::Error>(())
     }
     .await;

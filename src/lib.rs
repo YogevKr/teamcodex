@@ -12,6 +12,7 @@ pub mod service;
 pub mod sse;
 pub mod status;
 pub mod storage;
+pub mod topup;
 pub mod tui;
 
 pub fn now() -> u64 {

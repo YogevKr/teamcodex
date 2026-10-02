@@ -109,6 +109,7 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.yogevkr.teamcodex.pl
 - Account fallback after model access, credential, rate-limit, or connection errors.
 - Retryable responses for transient overloads.
 - Usage-limit reset credit listing, redemption, and optional automatic redemption.
+- ChatGPT credit balance per account and opt-in credit spending after a usage limit.
 - Terminal, table, and JSON status views.
 - A Codex launcher that leaves existing configuration files unchanged.
 - Responses API streaming, tool calls, compaction, and `previous_response_id` routing.
@@ -156,6 +157,7 @@ The `kind` value is `chatgpt` or `api`.
 | `models` | Exact model names allowed for this account. An empty list allows all models. |
 | `threshold_percent` | Per-account quota threshold override. |
 | `auto_reset` | Redeem a reset credit when this account is blocked. Default: `false`. |
+| `spend_credits` | Use this account's credit balance after its Codex usage limit. ChatGPT accounts only. Default: `false`. |
 
 Example account entries:
 
@@ -297,6 +299,40 @@ Set `auto_reset: true` to redeem a credit when a blocked request has no other el
 One redemption serves concurrent requests.
 TeamCodex waits 300 seconds before another automatic redemption for the same account.
 
+### Credits
+
+ChatGPT Plus and Pro accounts can hold a credit balance.
+After the plan usage limit, the upstream serves Codex requests from that balance.
+TeamCodex reads the balance from usage polls and `x-codex-credits-*` response headers.
+`tcx status` shows it in the `CREDITS` column and the `credits` JSON field.
+
+TeamCodex does not route to a limited account by default, so it spends no credits.
+Set `spend_credits: true` on an account to let it serve requests from its credits:
+
+- Credits serve only while the account's auto top-up is off. See below.
+- Accounts with plan quota serve first. Credits serve only when no account has plan quota left.
+- An account with plan quota on a rate-limit, overload, or connection hold makes the pool wait instead.
+- A failed credential does not make the pool wait.
+- Credits lift only the Codex plan windows, not other quota windows or a group's `shared_percent` reserve.
+- A session moves back to an account with plan quota when one recovers.
+- Usage-limit reset credits apply before credits when `auto_reset` is set.
+- Spending stops when the reported balance reaches zero.
+
+The table marks an opted-in account with `spend` in `CREDITS`.
+Its state is `credits` while it serves from credits.
+`credit_requests` and the `credit calls` note count the requests routed to credits.
+
+Auto top-up buys credits with the account's payment method when the balance drops below a minimum.
+Each probe reads the setting from `/backend-api/subscriptions/auto_top_up/settings`.
+The `auto_top_up` status field holds the result. A failed read keeps the last known value.
+TeamCodex spends credits only after a read reports auto top-up off.
+The table note shows `auto top-up ON`, or `auto top-up unknown` for an opted-in account before the first read.
+
+```sh
+tcx --config config.json top-up personal            # Show the setting
+tcx --config config.json top-up personal --disable  # Turn auto top-up off
+```
+
 ## Commands
 
 ```sh
@@ -313,6 +349,7 @@ tcx account NAME disable            # Disable an account until restart
 tcx reload                          # Apply account changes to a running server
 tcx reset NAME --list               # List reset credits
 tcx reset NAME [--credit ID]        # Redeem a reset credit
+tcx top-up NAME [--disable]         # Show or turn off credit auto top-up
 tcx codex-config                    # Print Codex provider settings
 tcx run [--group NAME] -- ARGS      # Run Codex through the proxy
 tcx example                         # Print an example configuration
@@ -341,6 +378,8 @@ All routes require `Authorization: Bearer <local proxy token>`.
 | POST | `/reload` | Reload the configuration file. |
 | GET | `/accounts/{name}/reset-credits` | List upstream reset credits. |
 | POST | `/accounts/{name}/reset` | Redeem a reset credit. |
+| GET | `/accounts/{name}/auto-top-up` | Read the credit auto top-up setting. |
+| POST | `/accounts/{name}/auto-top-up/disable` | Turn credit auto top-up off. |
 | POST | `/v1/responses` | Forward a Responses API request. |
 | POST | `/v1/responses/compact` | Forward a compaction request. |
 | GET | `/v1/models` | Forward the model list request. |

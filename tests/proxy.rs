@@ -22,7 +22,7 @@ use teamcodex::{
     now,
     pool::{Pool, Reload},
     proxy,
-    quota::Window,
+    quota::{Credits, Window},
 };
 
 const CLIENT_TOKEN: &str = "test-client-token-not-a-secret";
@@ -86,7 +86,7 @@ fn config(base: &str) -> Config {
                 argv: vec!["python3".into(), "-c".into(), format!("import json; print(json.dumps({{'access_token':'test-upstream-{name}'}}))")],
                 cache_seconds: 240,
             },
-            priority: 0, disabled: false, groups: vec![], shared_percent: 0.0, models: vec![], threshold_percent: None, auto_reset: false,
+            priority: 0, disabled: false, groups: vec![], shared_percent: 0.0, models: vec![], threshold_percent: None, auto_reset: false, spend_credits: false,
         }).collect(),
     }
 }
@@ -2299,6 +2299,330 @@ async fn accounts_without_opt_in_never_redeem_automatically() {
             .any(|(_, _, uri)| uri.ends_with("/consume"))
     );
     assert_eq!(pool.snapshot().accounts[0].reset_credits, Some(1));
+}
+
+fn balance(amount: f64) -> Option<Credits> {
+    Some(Credits {
+        has_credits: amount > 0.0,
+        unlimited: false,
+        balance: Some(amount),
+    })
+}
+
+/// Two ChatGPT accounts; `b` spends credits after its Codex limit.
+fn credit_pool(cfg: &mut Config) -> Arc<Pool> {
+    for account in &mut cfg.accounts {
+        account.kind = Kind::Chatgpt;
+        account.account_id = Some(format!("test-{}", account.name));
+    }
+    cfg.accounts[1].spend_credits = true;
+    let pool = Pool::new(cfg.clone()).unwrap();
+    for idx in 0..cfg.accounts.len() {
+        pool.set_auto_top_up(idx, Some(false));
+    }
+    pool
+}
+
+fn limit(pool: &Pool, idx: usize, used: f64) {
+    pool.update_quotas(
+        idx,
+        [("codex-primary".into(), quota_window(used, now() + 100))].into(),
+    );
+}
+
+#[test]
+fn credits_serve_a_limited_account_only_after_plan_quota_runs_out() {
+    let mut cfg = config("http://127.0.0.1:1");
+    cfg.model_limits
+        .insert("spark".into(), vec!["codex-spark".into()]);
+    let pool = credit_pool(&mut cfg);
+    pool.set_credits(0, balance(50.0));
+    pool.set_credits(1, balance(50.0));
+    limit(&pool, 1, 100.0);
+    assert_eq!(pool.select("test", None, None, None, &[]).unwrap().idx, 0);
+    // `a` has credits too, but it did not opt in.
+    limit(&pool, 0, 100.0);
+    assert!(!pool.has_eligible("test", None, None));
+    assert_eq!(pool.select("test", None, None, None, &[]).unwrap().idx, 1);
+    let snapshot = pool.snapshot();
+    assert_eq!(snapshot.accounts[0].credit_requests, 0);
+    assert_eq!(snapshot.accounts[1].credit_requests, 1);
+    assert!(snapshot.accounts[1].spend_credits);
+    assert_eq!(snapshot.accounts[1].credits, balance(50.0));
+    // The request already tried `b`: no second credit account exists.
+    assert!(pool.select("test", None, None, None, &[1]).is_none());
+
+    // Auto top-up can charge a payment method: no spending while it is on.
+    pool.set_auto_top_up(1, Some(true));
+    assert!(pool.select("test", None, None, None, &[]).is_none());
+    pool.set_auto_top_up(1, None);
+    assert_eq!(
+        pool.snapshot().accounts[1].auto_top_up,
+        Some(true),
+        "a failed read keeps the last state"
+    );
+    pool.set_auto_top_up(1, Some(false));
+    assert_eq!(pool.select("test", None, None, None, &[]).unwrap().idx, 1);
+
+    // Credits lift only the Codex plan windows.
+    pool.update_quotas(
+        1,
+        [(
+            "codex-spark-primary".into(),
+            quota_window(100.0, now() + 100),
+        )]
+        .into(),
+    );
+    assert!(pool.select("spark", None, None, None, &[]).is_none());
+    assert_eq!(pool.select("test", None, None, None, &[]).unwrap().idx, 1);
+
+    // An empty balance stops spending; an unlimited one restores it.
+    pool.set_credits(1, balance(0.0));
+    assert!(pool.select("test", None, None, None, &[]).is_none());
+    pool.set_credits(
+        1,
+        Some(Credits {
+            has_credits: false,
+            unlimited: true,
+            balance: None,
+        }),
+    );
+    assert_eq!(pool.select("test", None, None, None, &[]).unwrap().idx, 1);
+    pool.set_credits(1, None);
+    assert!(
+        pool.snapshot().accounts[1].credits.is_some(),
+        "a missing report keeps the last balance"
+    );
+
+    // Opting out applies on reload and keeps the balance.
+    cfg.accounts[1].spend_credits = false;
+    assert_eq!(pool.reload(cfg.clone()).unwrap().updated, vec!["b"]);
+    assert!(pool.select("test", None, None, None, &[]).is_none());
+    assert!(!pool.snapshot().accounts[1].spend_credits);
+    assert!(pool.snapshot().accounts[1].credits.is_some());
+}
+
+#[test]
+fn credits_wait_for_transient_holds_and_sessions_return_to_plan_quota() {
+    let mut cfg = config("http://127.0.0.1:1");
+    let pool = credit_pool(&mut cfg);
+    pool.set_credits(1, balance(50.0));
+    limit(&pool, 0, 10.0);
+    limit(&pool, 1, 100.0);
+    // `a` has quota and recovers by itself: wait instead of spending.
+    pool.defer(0, now() + 30, "rate_limited");
+    assert!(pool.select("test", None, Some("s"), None, &[]).is_none());
+    pool.defer(0, now() + 30, "overloaded");
+    assert!(pool.select("test", None, Some("s"), None, &[]).is_none());
+    // A failed credential needs a login, so credits serve meanwhile.
+    pool.hold(0, now() + 30, "credential_unavailable");
+    assert_eq!(
+        pool.select("test", None, Some("s"), None, &[]).unwrap().idx,
+        1
+    );
+    // The session leaves the credit account once plan quota is back.
+    pool.credentials_verified(0);
+    assert_eq!(
+        pool.select("test", None, Some("s"), None, &[]).unwrap().idx,
+        0
+    );
+    assert_eq!(pool.snapshot().accounts[1].credit_requests, 1);
+}
+
+#[test]
+fn credits_keep_the_shared_cap_reserve_for_the_group() {
+    let mut cfg = config("http://127.0.0.1:1");
+    cfg.accounts[1].groups = vec!["reserved".into()];
+    cfg.accounts[1].shared_percent = 20.0;
+    let pool = credit_pool(&mut cfg);
+    pool.set_credits(1, balance(50.0));
+    limit(&pool, 0, 100.0);
+    limit(&pool, 1, 50.0);
+    assert!(pool.select("test", None, None, None, &[]).is_none());
+    assert_eq!(
+        pool.select("test", Some("reserved"), None, None, &[])
+            .unwrap()
+            .idx,
+        1
+    );
+    assert_eq!(pool.snapshot().accounts[1].credit_requests, 0);
+    limit(&pool, 1, 97.0);
+    assert_eq!(pool.select("test", None, None, None, &[]).unwrap().idx, 1);
+    assert_eq!(
+        pool.select("test", Some("reserved"), None, None, &[])
+            .unwrap()
+            .idx,
+        1
+    );
+    assert_eq!(pool.snapshot().accounts[1].credit_requests, 2);
+}
+
+#[test]
+fn spend_credits_requires_a_chatgpt_account() {
+    let mut cfg = config("http://127.0.0.1:1");
+    cfg.accounts[0].spend_credits = true;
+    assert!(cfg.validate().is_err());
+    cfg.accounts[0].kind = Kind::Chatgpt;
+    cfg.accounts[0].account_id = Some("test-a".into());
+    assert!(cfg.validate().is_ok());
+}
+
+#[tokio::test]
+async fn probe_and_responses_report_credits_and_opt_in_routes_to_them() {
+    let credits = Arc::new(Mutex::new(
+        json!({"has_credits": true, "unlimited": false, "balance": "40"}),
+    ));
+    let reported = credits.clone();
+    let top_up = Arc::new(Mutex::new(true));
+    let charging = top_up.clone();
+    let mock = mock(move |_, path, _| {
+        match path {
+        "/subscriptions/auto_top_up/settings" => Json(json!({
+            "is_enabled": *charging.lock().unwrap(), "recharge_threshold": "100", "recharge_target": "500"
+        }))
+        .into_response(),
+        "/subscriptions/auto_top_up/disable" => {
+            *charging.lock().unwrap() = false;
+            Json(json!({})).into_response()
+        }
+        "/usage" => Json(json!({
+            "plan_type": "plus",
+            "rate_limit": {"primary_window": {"used_percent": 100, "reset_at": now() + 3600, "limit_window_seconds": 604800}},
+            "credits": *reported.lock().unwrap()
+        }))
+        .into_response(),
+        _ => (
+            [
+                ("x-codex-credits-has-credits", "true"),
+                ("x-codex-credits-unlimited", "false"),
+                ("x-codex-credits-balance", "39.5"),
+            ],
+            Json(completed("resp_credit")),
+        )
+            .into_response(),
+    }
+    });
+    let source = upstream(&mock).await;
+    let mut cfg = chatgpt_config(&source.url, false);
+    let (pool, server) = gateway(cfg.clone()).await;
+    let responses = |mock: &Mock| {
+        mock.calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, _, uri)| uri.ends_with("/responses"))
+            .count()
+    };
+    proxy::probe_once(&pool).await;
+    assert_eq!(pool.snapshot().accounts[0].credits, balance(40.0));
+    let refused = post(&server)
+        .json(&json!({"model":"test"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(refused.status(), 429, "no opt-in, no spending");
+    assert_eq!(responses(&mock), 0);
+
+    cfg.accounts[0].spend_credits = true;
+    pool.reload(cfg).unwrap();
+    assert_eq!(pool.snapshot().accounts[0].auto_top_up, Some(true));
+    let charging = post(&server)
+        .json(&json!({"model":"test"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(charging.status(), 429, "auto top-up on, no spending");
+    assert_eq!(responses(&mock), 0);
+
+    let client = reqwest::Client::new();
+    let read: Value = client
+        .get(format!("{}/accounts/a/auto-top-up", server.url))
+        .bearer_auth(CLIENT_TOKEN)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(read["is_enabled"], true);
+    let wrong = client
+        .get(format!("{}/accounts/a/auto-top-up/disable", server.url))
+        .bearer_auth(CLIENT_TOKEN)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(wrong.status(), 405);
+    let disabled: Value = client
+        .post(format!("{}/accounts/a/auto-top-up/disable", server.url))
+        .bearer_auth(CLIENT_TOKEN)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(disabled["is_enabled"], false);
+    assert!(!*top_up.lock().unwrap());
+    assert_eq!(pool.snapshot().accounts[0].auto_top_up, Some(false));
+    {
+        let calls = mock.calls.lock().unwrap();
+        let (headers, _, uri) = calls
+            .iter()
+            .find(|(_, _, uri)| uri.ends_with("/disable"))
+            .expect("disable call");
+        assert_eq!(headers["x-openai-expected-account-id"], "test-account-id");
+        assert_eq!(headers["chatgpt-account-id"], "test-account-id");
+        assert!(uri.starts_with("/subscriptions/auto_top_up/"));
+        let (_, _, settings) = calls
+            .iter()
+            .find(|(_, _, uri)| uri.contains("/settings"))
+            .expect("settings call");
+        assert!(
+            settings.ends_with("?include_payment_method=false"),
+            "{settings}"
+        );
+    }
+
+    let served = post(&server)
+        .json(&json!({"model":"test"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(served.status(), 200);
+    assert_eq!(responses(&mock), 1);
+    let account = pool.snapshot().accounts.remove(0);
+    assert_eq!(account.credit_requests, 1);
+    assert_eq!(
+        account.credits,
+        balance(39.5),
+        "response headers update the balance"
+    );
+
+    *credits.lock().unwrap() = json!({"has_credits": false, "unlimited": false, "balance": "0"});
+    proxy::probe_once(&pool).await;
+    let depleted = post(&server)
+        .json(&json!({"model":"test"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(depleted.status(), 429);
+    let body: Value = depleted.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "pool_exhausted");
+    assert_eq!(responses(&mock), 1);
+
+    // A transient hold on a credit account is retryable, not a usage limit.
+    *credits.lock().unwrap() = json!({"has_credits": true, "unlimited": false, "balance": "40"});
+    proxy::probe_once(&pool).await;
+    pool.defer(0, now() + 30, "overloaded");
+    let held = post(&server)
+        .json(&json!({"model":"test"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(held.status(), 503);
+    let body: Value = held.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "rate_limit_exceeded");
+    assert_eq!(responses(&mock), 1);
 }
 
 #[tokio::test]

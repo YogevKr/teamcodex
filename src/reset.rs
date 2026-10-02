@@ -46,12 +46,15 @@ impl Outcome {
     }
 }
 
-async fn call(
+/// Call a ChatGPT backend route as the account. `expected_account` adds the
+/// account guard header that the ChatGPT web client sends to billing routes.
+pub(crate) async fn call(
     pool: &Arc<Pool>,
     idx: usize,
     method: Method,
     url: &str,
     body: Option<&Value>,
+    expected_account: bool,
 ) -> Result<Value> {
     let (account, auth) = pool.entry(idx).context("unknown account")?;
     let send = |token: Token| {
@@ -62,6 +65,9 @@ async fn call(
             .header("user-agent", "codex-cli")
             .timeout(TIMEOUT);
         if let Some(id) = token.account_id {
+            if expected_account {
+                request = request.header("x-openai-expected-account-id", &id);
+            }
             request = request.header("chatgpt-account-id", id);
         }
         if let Some(body) = body {
@@ -112,7 +118,7 @@ fn endpoint(pool: &Pool, idx: usize) -> Result<String> {
 /// List the account's reset credits and record the available count.
 pub async fn list(pool: &Arc<Pool>, idx: usize) -> Result<Value> {
     let url = endpoint(pool, idx)?;
-    let value = call(pool, idx, Method::GET, &url, None).await?;
+    let value = call(pool, idx, Method::GET, &url, None, false).await?;
     pool.set_reset_credits(idx, quota::reset_credits(&value));
     Ok(value)
 }
@@ -141,7 +147,7 @@ pub async fn redeem(
         ensure!(!id.is_empty(), "credit id must not be empty");
         body["credit_id"] = json!(id);
     }
-    let value = call(pool, idx, Method::POST, &url, Some(&body)).await?;
+    let value = call(pool, idx, Method::POST, &url, Some(&body), false).await?;
     let Ok(outcome) = serde_json::from_value::<Outcome>(value.clone()) else {
         bail!(
             "unexpected reset outcome: {}",
