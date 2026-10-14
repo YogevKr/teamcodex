@@ -569,7 +569,7 @@ async fn handle(State(app): State<App>, request: Request) -> Response {
         }
         if status.is_server_error() && !is_event_stream(upstream.headers()) {
             // An overload rejection before streaming was not processed upstream.
-            // Hold the account briefly and select another one for this request.
+            // Hold the model on this account briefly and select another account.
             let headers = response_headers(upstream.headers());
             let body = match read_bounded(
                 upstream,
@@ -594,7 +594,7 @@ async fn handle(State(app): State<App>, request: Request) -> Response {
                 .as_ref()
                 .and_then(|value| quota::overload_hold(value, now()))
             {
-                app.pool.defer(idx, until, "overloaded");
+                app.pool.defer_model(idx, model, until);
                 log_failure(
                     &app.pool,
                     idx,
@@ -683,7 +683,7 @@ fn log_hold(pool: &Pool, idx: usize, reason: &str, model: &str) {
         "{}",
         json!({
             "at": now(), "account": pool.account(idx).map(|a| a.name),
-            "outcome": reason, "model": model, "hold_until": pool.hold_until(idx),
+            "outcome": reason, "model": model, "hold_until": pool.hold_until(idx, model),
         })
     );
 }
@@ -903,7 +903,7 @@ fn log_failure(
         json!({
             "at": now(), "account": pool.account(idx).map(|a| a.name),
             "status": status, "outcome": outcome, "code": code,
-            "model": model, "hold_until": pool.hold_until(idx),
+            "model": model, "hold_until": pool.hold_until(idx, model),
         })
     );
 }
@@ -939,7 +939,9 @@ impl Observation {
                     self.lease.pool.defer(self.lease.idx, until, "rate_limited");
                     "stream_rate_limited"
                 } else if let Some(until) = quota::overload_hold(event, now()) {
-                    self.lease.pool.defer(self.lease.idx, until, "overloaded");
+                    self.lease
+                        .pool
+                        .defer_model(self.lease.idx, &self.model, until);
                     retry_at = Some(
                         if self.lease.pool.has_eligible(
                             &self.model,

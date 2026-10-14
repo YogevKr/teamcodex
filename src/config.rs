@@ -25,6 +25,10 @@ pub struct Config {
     pub model_limits: HashMap<String, Vec<String>>,
     #[serde(default)]
     pub prices: HashMap<String, Price>,
+    /// Command that runs when an account needs `tcx login` or works again.
+    /// It runs without a shell; the title and message follow its arguments.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notify_command: Vec<String>,
     #[serde(default)]
     pub accounts: Vec<Account>,
 }
@@ -200,6 +204,7 @@ impl Config {
             idle_timeout_seconds: idle_timeout(),
             model_limits: HashMap::new(),
             prices: HashMap::new(),
+            notify_command: Vec::new(),
             accounts: Vec::new(),
         }
     }
@@ -231,6 +236,12 @@ impl Config {
             ensure!(
                 path.is_absolute(),
                 "client_token_file must be an absolute path"
+            );
+        }
+        if let Some(program) = self.notify_command.first() {
+            ensure!(
+                Path::new(program).is_absolute(),
+                "notify_command must start with an absolute executable path"
             );
         }
         ensure!(

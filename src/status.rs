@@ -13,6 +13,7 @@ use serde_json::Value;
 /// windows block it.
 pub fn state_label(
     disabled: bool,
+    login_required: bool,
     hold_until: u64,
     quotas: &Quotas,
     threshold: f64,
@@ -26,6 +27,8 @@ pub fn state_label(
         .collect();
     if disabled {
         "disabled"
+    } else if login_required {
+        "login"
     } else if hold_until > now {
         "waiting"
     } else if over.is_empty() {
@@ -155,6 +158,7 @@ fn account_row(account: &Value, default_threshold: f64, now: u64) -> Vec<String>
         .and_then(|v| serde_json::from_value(v).ok())
         .unwrap_or_default();
     let disabled = account["disabled"].as_bool().unwrap_or(false);
+    let login_required = account["login_required"].as_bool().unwrap_or(false);
     let hold_until = account["hold_until"].as_u64().unwrap_or(0);
     let credits: Option<Credits> = account
         .get("credits")
@@ -184,6 +188,21 @@ fn account_row(account: &Value, default_threshold: f64, now: u64) -> Vec<String>
     if hold_until > now {
         note.push(format!("hold {}", countdown(hold_until, now)));
     }
+    let mut model_holds: Vec<(&str, u64)> = account
+        .get("model_holds")
+        .and_then(Value::as_object)
+        .map(|holds| {
+            holds
+                .iter()
+                .filter_map(|(model, until)| Some((model.as_str(), until.as_u64()?)))
+                .filter(|(_, until)| *until > now)
+                .collect()
+        })
+        .unwrap_or_default();
+    model_holds.sort();
+    for (model, until) in model_holds {
+        note.push(format!("overloaded {model} {}", countdown(until, now)));
+    }
     match top_up {
         Some(true) => note.push("auto top-up ON".to_owned()),
         None if spend => note.push("auto top-up unknown".to_owned()),
@@ -195,7 +214,16 @@ fn account_row(account: &Value, default_threshold: f64, now: u64) -> Vec<String>
     }
     vec![
         account["name"].as_str().unwrap_or("?").to_owned(),
-        state_label(disabled, hold_until, &quotas, threshold, spending, now).to_owned(),
+        state_label(
+            disabled,
+            login_required,
+            hold_until,
+            &quotas,
+            threshold,
+            spending,
+            now,
+        )
+        .to_owned(),
         format!("{threshold:.0}%"),
         remaining(&quotas, Kind::Short, now),
         remaining(&quotas, Kind::Weekly, now),
@@ -275,13 +303,14 @@ pub fn render(status: &Value, threshold: f64, now: u64) -> String {
         .count();
     let ready = rows.iter().filter(|r| r[1] == "ready").count() - group_only;
     let on_credits = rows.iter().filter(|r| r[1] == "credits").count();
+    let need_login = rows.iter().filter(|r| r[1] == "login").count();
     let routing = match status["routing_healthy"].as_bool() {
         Some(true) => "ok",
         Some(false) => "UNHEALTHY",
         None => "-",
     };
     let mut out = format!(
-        "accounts {}  ready {}{}{}  threshold {:.0}%  routing {}\n",
+        "accounts {}  ready {}{}{}{}  threshold {:.0}%  routing {}\n",
         rows.len(),
         ready,
         if group_only > 0 {
@@ -291,6 +320,11 @@ pub fn render(status: &Value, threshold: f64, now: u64) -> String {
         },
         if on_credits > 0 {
             format!(" (+{on_credits} on credits)")
+        } else {
+            String::new()
+        },
+        if need_login > 0 {
+            format!("  need login {need_login}")
         } else {
             String::new()
         },
@@ -478,6 +512,44 @@ mod tests {
         assert!(
             team.ends_with("credential_unavailable, hold +23s"),
             "{team}"
+        );
+    }
+
+    #[test]
+    fn expired_login_reads_login_and_is_counted_in_the_header() {
+        let mut status = status();
+        status["accounts"][1]["login_required"] = json!(true);
+        status["accounts"][1]["last_error"] = json!("login_or_refresh_required");
+        let text = render(&status, 95.0, 1000);
+        assert!(
+            text.starts_with("accounts 3  ready 0  need login 1  threshold 95%"),
+            "{text}"
+        );
+        let team = row(&text, "team");
+        assert_eq!(team.split_whitespace().nth(1), Some("login"), "{team}");
+        assert!(
+            team.ends_with("login_or_refresh_required, hold +23s"),
+            "{team}"
+        );
+    }
+
+    #[test]
+    fn model_overload_hold_shows_in_note_and_keeps_the_account_ready() {
+        let mut status = status();
+        status["accounts"][0]["quotas"] = json!({});
+        status["accounts"][0]["model_holds"] =
+            json!({"gpt-b": 1045, "gpt-a": 1030, "expired": 900});
+        let text = render(&status, 95.0, 1000);
+        assert!(text.starts_with("accounts 3  ready 1  threshold"), "{text}");
+        let personal = row(&text, "personal");
+        assert_eq!(
+            personal.split_whitespace().nth(1),
+            Some("ready"),
+            "{personal}"
+        );
+        assert!(
+            personal.ends_with("overloaded gpt-a +30s, overloaded gpt-b +45s"),
+            "{personal}"
         );
     }
 

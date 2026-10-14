@@ -187,20 +187,76 @@ pub async fn refresh_loop(pool: std::sync::Arc<crate::pool::Pool>) {
             .map(|(idx, account, auth)| {
                 let pool = &pool;
                 async move {
-                    let failed = auth.get(&account, None).await.is_err();
-                    let mut state = pool.state.lock().unwrap();
-                    if failed {
-                        state.accounts[idx].last_error = Some("login_or_refresh_required".into());
-                    } else if state.accounts[idx].last_error.as_deref()
-                        == Some("login_or_refresh_required")
-                    {
-                        state.accounts[idx].last_error = None;
-                    }
+                    let result = auth.get(&account, None).await;
+                    observe_login(pool, idx, &account.name, &result);
                 }
             });
         futures_util::future::join_all(jobs).await;
         tokio::time::sleep(Duration::from_secs(30)).await;
     }
+}
+
+/// Record a background credential check. When the stored login stops or
+/// starts working, write one JSON line to the log and run `notify_command`.
+pub fn observe_login(pool: &crate::pool::Pool, idx: usize, name: &str, result: &Result<Token>) {
+    let login = match result {
+        Ok(_) => Some(false),
+        Err(error) => crate::oauth::login_required(error).then_some(true),
+    };
+    let Some(required) = pool.credential_checked(idx, result.is_ok(), login) else {
+        return;
+    };
+    let event = if required {
+        "login_required"
+    } else {
+        "login_restored"
+    };
+    eprintln!(
+        "{}",
+        serde_json::json!({"at": now(), "event": event, "account": name})
+    );
+    let (title, message) = if required {
+        (
+            "TeamCodex: login required",
+            format!("{name} needs a new login. Run: tcx login --name {name}"),
+        )
+    } else {
+        ("TeamCodex: login restored", format!("{name} works again."))
+    };
+    notify(&pool.config.notify_command, title, &message);
+}
+
+/// Run the notify command without a shell, with the title and message as its
+/// last two arguments. Its output is discarded; it has 15 seconds to finish.
+fn notify(argv: &[String], title: &str, message: &str) {
+    let Some((program, args)) = argv.split_first() else {
+        return;
+    };
+    let mut command = Command::new(program);
+    command
+        .args(args)
+        .arg(title)
+        .arg(message)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    tokio::spawn(async move {
+        let outcome = match command.spawn() {
+            Ok(mut child) => {
+                match tokio::time::timeout(Duration::from_secs(15), child.wait()).await {
+                    Ok(Ok(status)) if status.success() => return,
+                    Ok(_) => "failed",
+                    Err(_) => "timed_out",
+                }
+            }
+            Err(_) => "not_started",
+        };
+        eprintln!(
+            "{}",
+            serde_json::json!({"at": now(), "event": "notify_failed", "outcome": outcome})
+        );
+    });
 }
 
 #[cfg(test)]

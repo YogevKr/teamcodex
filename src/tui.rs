@@ -26,6 +26,7 @@ pub fn draw(frame: &mut Frame, pool: &Pool) {
     let rows = snapshot.accounts.iter().map(|a| {
         let status = status::state_label(
             a.disabled,
+            a.login_required,
             a.hold_until,
             &a.quotas,
             a.threshold_percent,

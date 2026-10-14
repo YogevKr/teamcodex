@@ -107,7 +107,8 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.yogevkr.teamcodex.pl
 - Quota polling for ChatGPT accounts.
 - Response-header quota tracking for API accounts.
 - Account fallback after model access, credential, rate-limit, or connection errors.
-- Retryable responses for transient overloads.
+- Retryable responses for transient overloads, with per-model overload holds.
+- Login alerts through a configurable notify command.
 - Usage-limit reset credit listing, redemption, and optional automatic redemption.
 - ChatGPT credit balance per account and opt-in credit spending after a usage limit.
 - Terminal, table, and JSON status views.
@@ -138,6 +139,7 @@ Configuration files contain credential references, not credential values.
 | `idle_timeout_seconds` | Upstream response and stream inactivity limit. Default: `300`. |
 | `model_limits` | Map model names to extra quota bucket IDs. |
 | `prices` | Optional per-million-token price estimates. |
+| `notify_command` | Optional command for login alerts. Use an absolute executable path. |
 | `accounts` | Configured account list. Names must be unique. |
 
 ### Account fields
@@ -228,6 +230,28 @@ It refreshes tokens within five minutes of expiry.
 A temporary refresh error keeps an unexpired token and delays the next attempt.
 An expired or revoked refresh token requires `tcx login`.
 
+An account that requires `tcx login` shows the `login` state in `tcx status`.
+The table header counts these accounts as `need login N`.
+The `login_required` status field is `true` for these accounts.
+The server writes a `login_required` event to its log once for each change.
+A working login writes a `login_restored` event and returns the account to selection.
+
+Set `notify_command` to run a command for each event.
+The command runs without a shell. TeamCodex adds the title and the message as its last two arguments.
+The command has 15 seconds to finish. A failure writes a `notify_failed` event.
+This example shows a macOS notification:
+
+```json
+"notify_command": [
+  "/usr/bin/osascript",
+  "-e", "on run argv",
+  "-e", "display notification (item 2 of argv) with title (item 1 of argv)",
+  "-e", "end run"
+]
+```
+
+The server reads `notify_command` at startup. Restart the server after you change it.
+
 ### External credentials
 
 A credential command runs without a shell.
@@ -268,6 +292,8 @@ TeamCodex uses these rules:
 - Quota thresholds exclude accounts before their limit.
 - The proxy tries another eligible account after a model access rejection.
 - Rate limits, credential failures, and connection failures create temporary holds.
+- An overload holds only the overloaded model on that account. Other models stay available.
+- The table note shows an overload hold as `overloaded MODEL +Ns`.
 - Temporary holds return HTTP 503 with `Retry-After` so Codex can retry.
 - Quota exhaustion returns HTTP 429 with `usage_limit_reached`.
 - The response includes a reset time when the proxy knows one.
@@ -312,7 +338,7 @@ Set `spend_credits: true` on an account to let it serve requests from its credit
 - Credits serve only while the account's auto top-up is off. See below.
 - Accounts with plan quota serve first. Credits serve only when no account has plan quota left.
 - An account with plan quota on a rate-limit, overload, or connection hold makes the pool wait instead.
-- A failed credential does not make the pool wait.
+- A failed credential or an expired login does not make the pool wait.
 - Credits lift only the Codex plan windows, not other quota windows or a group's `shared_percent` reserve.
 - A session moves back to an account with plan quota when one recovers.
 - Usage-limit reset credits apply before credits when `auto_reset` is set.

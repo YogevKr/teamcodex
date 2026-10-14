@@ -24,6 +24,24 @@ const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const ISSUER: &str = "https://auth.openai.com";
 const REFRESH_EARLY: u64 = 300;
 
+/// The stored login cannot produce a token until `tcx login` runs again.
+/// A temporary refresh failure is a different error.
+#[derive(Debug)]
+pub struct LoginRequired(&'static str);
+
+impl std::fmt::Display for LoginRequired {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0)
+    }
+}
+
+impl std::error::Error for LoginRequired {}
+
+/// True when `error` shows that the account needs `tcx login`.
+pub fn login_required(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<LoginRequired>().is_some()
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 pub struct StoredTokens {
     pub access_token: String,
@@ -41,7 +59,7 @@ pub struct StoredTokens {
 impl StoredTokens {
     pub fn load(path: &Path) -> Result<Self> {
         let tokens: Self = serde_json::from_slice(&storage::read_private(path)?)
-            .map_err(|_| anyhow::anyhow!("invalid managed credentials; run tcx login again"))?;
+            .map_err(|_| LoginRequired("invalid managed credentials; run tcx login again"))?;
         tokens.validate()?;
         Ok(tokens)
     }
@@ -254,10 +272,9 @@ impl OAuthClient {
         // not unlock competing processes that share this refresh token.
         let _lock = storage::lock(&path.with_extension("lock")).await?;
         let mut stored = StoredTokens::load(path)?;
-        ensure!(
-            !stored.login_required,
-            "account login expired; run tcx login again"
-        );
+        if stored.login_required {
+            return Err(LoginRequired("account login expired; run tcx login again").into());
+        }
         let rejected = rejected_access_token == Some(stored.access_token.as_str());
         if !rejected && stored.expires_at > now() + REFRESH_EARLY {
             return Ok(stored.token());
@@ -283,7 +300,10 @@ impl OAuthClient {
                         // if its identity or token shape is unusable. Do not reuse it.
                         stored.login_required = true;
                         stored.save(path)?;
-                        bail!("invalid refreshed credentials; run tcx login again")
+                        Err(
+                            LoginRequired("invalid refreshed credentials; run tcx login again")
+                                .into(),
+                        )
                     }
                 }
             }
@@ -294,11 +314,10 @@ impl OAuthClient {
                 if !permanent && !rejected && stored.expires_at > now() + 5 {
                     return Ok(stored.token());
                 }
-                bail!(if permanent {
-                    "account login expired; run tcx login again"
-                } else {
-                    "account refresh unavailable; retry shortly"
-                })
+                if permanent {
+                    return Err(LoginRequired("account login expired; run tcx login again").into());
+                }
+                bail!("account refresh unavailable; retry shortly")
             }
         }
     }
@@ -708,8 +727,9 @@ mod tests {
                 .managed(&path, Some(&previous.access_token))
                 .await
                 .err()
-                .unwrap()
-                .to_string();
+                .unwrap();
+            assert!(!login_required(&error), "a temporary failure: {error}");
+            let error = error.to_string();
             assert!(!error.contains("private-response"));
             assert_eq!(calls.load(Ordering::SeqCst), 1);
             assert!(!StoredTokens::load(&path).unwrap().login_required);
@@ -745,7 +765,9 @@ mod tests {
             let path = temp.path().join("account.json");
             stored(now() + 30).save(&path).unwrap();
             for _ in 0..2 {
-                let error = client.managed(&path, None).await.err().unwrap().to_string();
+                let error = client.managed(&path, None).await.err().unwrap();
+                assert!(login_required(&error), "{error}");
+                let error = error.to_string();
                 assert!(error.contains("tcx login"));
                 assert!(!error.contains("private-response"));
             }

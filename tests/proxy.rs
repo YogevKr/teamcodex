@@ -78,6 +78,7 @@ fn config(base: &str) -> Config {
         threshold_percent: 95.0, probe_interval_seconds: 0, idle_timeout_seconds: 2,
         model_limits: HashMap::new(),
         prices: HashMap::new(),
+        notify_command: vec![],
         accounts: ["a", "b"].into_iter().map(|name| Account {
             name: name.into(), kind: Kind::Api, base_url: Some(base.into()), usage_url: None,
             account_id: None,
@@ -637,6 +638,17 @@ async fn held_credentials_report_the_hold_not_a_usage_limit() {
         assert!(body["error"].get("resets_at").is_none());
     }
     assert!(pool.snapshot().accounts[0].hold_until > now());
+    // The background check relabels the same broken login. The refusal still
+    // names credentials, not an upstream failure.
+    pool.credential_checked(0, false, Some(true));
+    let response = post(&server)
+        .json(&json!({"model":"test"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 503);
+    let body: Value = response.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "credentials_unavailable");
     assert!(mock.calls.lock().unwrap().is_empty());
 }
 
@@ -1346,7 +1358,7 @@ async fn stream_without_content_type_is_forwarded_and_observed() {
     assert!(body.contains("Please try again in "));
     let snapshot = pool.snapshot();
     assert_eq!(snapshot.recent[0].outcome, "stream_overloaded");
-    assert!(snapshot.accounts[0].hold_until > now());
+    assert!(snapshot.accounts[0].model_holds["test"] > now());
     let response = post(&server)
         .header("session_id", "untyped-stream-session")
         .json(&json!({"model":"test","stream":true}))
@@ -1368,7 +1380,7 @@ async fn stream_without_content_type_is_forwarded_and_observed() {
 }
 
 #[tokio::test]
-async fn stream_overload_holds_account_so_session_retry_rotates() {
+async fn stream_overload_holds_the_model_so_session_retry_rotates() {
     let failed = format!(
         "data: {}\n\n",
         json!({"type":"response.failed","response":{"error":{
@@ -1401,8 +1413,10 @@ async fn stream_overload_holds_account_so_session_retry_rotates() {
     );
     let snapshot = pool.snapshot();
     let hold = teamcodex::quota::OVERLOAD_HOLD_SECONDS;
-    assert!(snapshot.accounts[0].hold_until >= now() + hold - 2);
-    assert!(snapshot.accounts[0].hold_until <= now() + hold + 2);
+    let until = snapshot.accounts[0].model_holds["test"];
+    assert!(until >= now() + hold - 2);
+    assert!(until <= now() + hold + 2);
+    assert_eq!(snapshot.accounts[0].hold_until, 0, "only the model waits");
     assert_eq!(snapshot.accounts[0].errors, 1);
     assert_eq!(
         snapshot.accounts[0].last_error.as_deref(),
@@ -1498,7 +1512,7 @@ async fn overload_retry_delay_respects_routing_and_replaces_only_the_error() {
 }
 
 #[tokio::test]
-async fn http_overload_rejection_holds_account_and_replays_on_another() {
+async fn http_overload_rejection_holds_the_model_and_replays_on_another() {
     let mock = mock(move |token, _, _| {
         if token.ends_with("-a") {
             (
@@ -1530,8 +1544,10 @@ async fn http_overload_rejection_holds_account_and_replays_on_another() {
     assert_eq!(calls[0].0["authorization"], "Bearer test-upstream-a");
     assert_eq!(calls[1].0["authorization"], "Bearer test-upstream-b");
     let snapshot = pool.snapshot();
-    assert!(snapshot.accounts[0].hold_until >= now() + 19);
-    assert!(snapshot.accounts[0].hold_until <= now() + 22);
+    let until = snapshot.accounts[0].model_holds["test"];
+    assert!(until >= now() + 19);
+    assert!(until <= now() + 22);
+    assert_eq!(snapshot.accounts[0].hold_until, 0, "only the model waits");
     assert_eq!(
         snapshot.accounts[0].last_error.as_deref(),
         Some("upstream_overloaded")
@@ -2427,6 +2443,157 @@ fn credits_wait_for_transient_holds_and_sessions_return_to_plan_quota() {
         0
     );
     assert_eq!(pool.snapshot().accounts[1].credit_requests, 1);
+}
+
+#[test]
+fn expired_login_does_not_block_credits_and_a_working_token_clears_its_hold() {
+    let mut cfg = config("http://127.0.0.1:1");
+    let pool = credit_pool(&mut cfg);
+    pool.set_credits(1, balance(50.0));
+    limit(&pool, 1, 100.0);
+    // `a` has no quota windows: its login expired before a probe read them.
+    // The probe holds it, then the background check relabels the failure.
+    pool.defer(0, now() + 65, "credential_unavailable");
+    assert_eq!(pool.credential_checked(0, false, Some(true)), Some(true));
+    assert_eq!(
+        pool.credential_checked(0, false, Some(true)),
+        None,
+        "report a change once"
+    );
+    let a = pool.snapshot().accounts[0].clone();
+    assert!(a.login_required);
+    assert_eq!(a.last_error.as_deref(), Some("login_or_refresh_required"));
+    assert_eq!(
+        pool.select("test", None, None, None, &[]).unwrap().idx,
+        1,
+        "credits serve while the login is broken"
+    );
+    assert_eq!(
+        pool.active_hold("test", None, None).unwrap().1,
+        "login_or_refresh_required"
+    );
+    // A temporary failure keeps the login state.
+    assert_eq!(pool.credential_checked(0, false, None), None);
+    // A renewed login serves at once, before the probe hold ends.
+    assert_eq!(pool.credential_checked(0, true, Some(false)), Some(false));
+    let a = pool.snapshot().accounts[0].clone();
+    assert!(!a.login_required);
+    assert_eq!(a.hold_until, 0);
+    assert_eq!(a.last_error, None);
+    assert_eq!(pool.select("test", None, None, None, &[]).unwrap().idx, 0);
+}
+
+#[tokio::test]
+async fn expired_login_is_reported_once_and_runs_the_notify_command() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("a.json");
+    let log = directory.path().join("notify.log");
+    teamcodex::oauth::StoredTokens {
+        access_token: "synthetic-access".into(),
+        refresh_token: "synthetic-refresh".into(),
+        account_id: "test-a".into(),
+        user_id: "user-a".into(),
+        expires_at: now() + 3600,
+        email: None,
+        retry_after: 0,
+        login_required: true,
+    }
+    .save(&path)
+    .unwrap();
+    let mut cfg = config("http://127.0.0.1:1");
+    cfg.accounts.truncate(1);
+    cfg.accounts[0].kind = Kind::Chatgpt;
+    cfg.accounts[0].account_id = Some("test-a".into());
+    cfg.accounts[0].user_id = Some("user-a".into());
+    cfg.accounts[0].credential = Credential::Managed { path };
+    cfg.notify_command = vec![
+        "/bin/sh".into(),
+        "-c".into(),
+        format!("printf '%s|%s\\n' \"$0\" \"$1\" >> '{}'", log.display()),
+    ];
+    let pool = Pool::new(cfg).unwrap();
+    let (account, auth) = pool.entry(0).unwrap();
+    let read = || std::fs::read_to_string(&log).unwrap_or_default();
+    let wait_for = |lines: usize| async move {
+        for _ in 0..100 {
+            if read().lines().count() >= lines {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    };
+
+    for _ in 0..2 {
+        let result = auth.get(&account, None).await;
+        assert!(result.is_err());
+        teamcodex::auth::observe_login(&pool, 0, "a", &result);
+    }
+    wait_for(1).await;
+    let a = pool.snapshot().accounts[0].clone();
+    assert!(a.login_required);
+    assert_eq!(a.last_error.as_deref(), Some("login_or_refresh_required"));
+    let token = teamcodex::auth::Token {
+        access_token: "synthetic-access".into(),
+        account_id: Some("test-a".into()),
+        user_id: None,
+        expires_at: None,
+        generation: 0,
+    };
+    teamcodex::auth::observe_login(&pool, 0, "a", &Ok(token));
+    wait_for(2).await;
+    assert_eq!(
+        read(),
+        "TeamCodex: login required|a needs a new login. Run: tcx login --name a\n\
+         TeamCodex: login restored|a works again.\n"
+    );
+    assert!(!pool.snapshot().accounts[0].login_required);
+}
+
+#[tokio::test]
+async fn stream_overload_holds_only_that_model_on_the_account() {
+    let failed = format!(
+        "data: {}\n\n",
+        json!({"type":"response.failed","response":{"error":{
+        "code":"server_is_overloaded","message":"The server is overloaded."}}})
+    );
+    let mock = mock(move |_, _, body| {
+        if String::from_utf8_lossy(body).contains("busy") {
+            ([("content-type", "text/event-stream")], failed.clone()).into_response()
+        } else {
+            sse_response()
+        }
+    });
+    let source = upstream(&mock).await;
+    let mut cfg = config(&source.url);
+    cfg.accounts.truncate(1);
+    let (pool, server) = gateway(cfg).await;
+    let send = |model: &'static str| {
+        post(&server)
+            .json(&json!({"model":model,"stream":true}))
+            .send()
+    };
+    let body = send("busy").await.unwrap().text().await.unwrap();
+    assert!(body.contains("rate_limit_exceeded"), "{body}");
+    let a = pool.snapshot().accounts[0].clone();
+    assert_eq!(a.hold_until, 0);
+    assert!(a.model_holds["busy"] > now());
+    assert!(pool.has_eligible("free", None, None));
+    assert!(!pool.has_eligible("busy", None, None));
+
+    let free = send("free").await.unwrap();
+    assert_eq!(free.status(), 200);
+    free.bytes().await.unwrap();
+    assert_eq!(
+        mock.calls.lock().unwrap().len(),
+        2,
+        "another model is served"
+    );
+
+    let busy = send("busy").await.unwrap();
+    assert_eq!(busy.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body: Value = busy.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "rate_limit_exceeded");
+    assert_eq!(mock.calls.lock().unwrap().len(), 2, "the held model waits");
 }
 
 #[test]

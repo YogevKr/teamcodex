@@ -16,11 +16,18 @@ use std::{
 
 const REMOVED_FROM_CONFIG: &str = "removed_from_config";
 
-/// Hold reasons that a working credential fetch clears.
+/// Last error of a managed account whose background token check failed.
+pub const LOGIN_FAILED: &str = "login_or_refresh_required";
+
+/// Hold reasons that a working credential fetch clears. A credential failure
+/// does not recover by itself, so the pool does not wait for it.
 pub fn credential_failure(reason: &str) -> bool {
     matches!(
         reason,
-        "credential_unavailable" | "credential_refresh_failed" | "authentication_failed"
+        "credential_unavailable"
+            | "credential_refresh_failed"
+            | "authentication_failed"
+            | LOGIN_FAILED
     )
 }
 
@@ -31,6 +38,62 @@ fn codex_window(key: &str) -> bool {
 
 const MODEL_RETRY_SECONDS: u64 = 300;
 const MODEL_CACHE_LIMIT: usize = 256;
+
+/// Hold reason for upstream capacity errors.
+const OVERLOADED: &str = "overloaded";
+
+/// Store `model` until `until` in a bounded per-model map. Expired entries go
+/// first; a full map drops the entry that ends first.
+fn remember_model(models: &mut HashMap<String, u64>, model: &str, until: u64) {
+    let at = now();
+    models.retain(|_, until| *until > at);
+    if models.len() >= MODEL_CACHE_LIMIT
+        && !models.contains_key(model)
+        && let Some(oldest) = models
+            .iter()
+            .min_by_key(|(_, until)| *until)
+            .map(|(name, _)| name.clone())
+    {
+        models.remove(&oldest);
+    }
+    models.insert(model.to_owned(), until);
+}
+
+/// Clear a hold that a failed credential fetch placed.
+fn clear_credential_hold(account: &mut AccountState) {
+    if account
+        .last_error
+        .as_deref()
+        .is_some_and(credential_failure)
+    {
+        account.hold_until = 0;
+        account.last_error = None;
+    }
+}
+
+/// The hold that keeps the account from serving `model`: the account hold
+/// with its reason, or the model's overload hold. Both end at the later time.
+fn blocking_hold<'a>(
+    account: &'a AccountState,
+    model: &str,
+    timestamp: u64,
+) -> Option<(u64, &'a str)> {
+    let account_hold = (account.hold_until > timestamp).then(|| {
+        (
+            account.hold_until,
+            account.last_error.as_deref().unwrap_or("hold"),
+        )
+    });
+    let model_hold = account
+        .model_holds
+        .get(model)
+        .filter(|until| **until > timestamp)
+        .map(|until| (*until, OVERLOADED));
+    match (account_hold, model_hold) {
+        (Some((until, reason)), Some((other, _))) => Some((until.max(other), reason)),
+        (hold, None) | (None, hold) => hold,
+    }
+}
 
 #[derive(Default, Clone, Serialize)]
 pub struct AccountState {
@@ -53,6 +116,11 @@ pub struct AccountState {
     pub unpriced_requests: u64,
     pub quotas: Quotas,
     pub unavailable_models: HashMap<String, u64>,
+    /// Overload holds per model. Other models on the account stay available.
+    pub model_holds: HashMap<String, u64>,
+    /// The stored login of a managed account no longer produces a token.
+    /// Only `tcx login` clears it.
+    pub login_required: bool,
     pub last_error: Option<String>,
     pub last_probe: Option<u64>,
     pub last_probe_ok: Option<bool>,
@@ -320,6 +388,8 @@ impl Pool {
                 live.credits = None;
                 live.auto_top_up = None;
                 live.unavailable_models.clear();
+                live.model_holds.clear();
+                live.login_required = false;
                 live.hold_until = 0;
             }
             if restored || entry.account.disabled != account.disabled {
@@ -352,6 +422,7 @@ impl Pool {
         let at = now();
         for account in &mut accounts {
             account.unavailable_models.retain(|_, until| *until > at);
+            account.model_holds.retain(|_, until| *until > at);
             for window in account.quotas.values_mut() {
                 window.used_percent = window.used(at);
             }
@@ -424,7 +495,7 @@ impl Pool {
             && !self.transient_hold(&entries, &state, model, group, pinned, timestamp);
         if credit {
             candidates = collect(&|config, idx, account| {
-                account.hold_until <= timestamp
+                blocking_hold(account, model, timestamp).is_none()
                     && self.on_credits(config, idx, account, model, group, pinned, timestamp)
             });
         }
@@ -569,7 +640,7 @@ impl Pool {
         timestamp: u64,
     ) -> bool {
         !account.disabled
-            && account.hold_until <= timestamp
+            && blocking_hold(account, model, timestamp).is_none()
             && self
                 .blocking_quotas(
                     account,
@@ -642,7 +713,7 @@ impl Pool {
         timestamp: u64,
     ) -> bool {
         !account.disabled
-            && account.hold_until > timestamp
+            && blocking_hold(account, model, timestamp).is_some()
             && self.matches(config, idx, model, group, pinned)
             && account
                 .unavailable_models
@@ -680,10 +751,8 @@ impl Pool {
                 group,
                 pinned,
                 timestamp,
-            ) && !account
-                .last_error
-                .as_deref()
-                .is_some_and(credential_failure)
+            ) && blocking_hold(account, model, timestamp)
+                .is_some_and(|(_, reason)| !credential_failure(reason))
         })
     }
 
@@ -772,7 +841,7 @@ impl Pool {
             .peekable();
         config.auto_reset
             && !account.disabled
-            && account.hold_until <= timestamp
+            && blocking_hold(account, model, timestamp).is_none()
             && account.reset_credits.is_some_and(|count| count > 0)
             && account
                 .unavailable_models
@@ -802,19 +871,11 @@ impl Pool {
             return;
         }
         let mut state = self.state.lock().unwrap();
-        let models = &mut state.accounts[idx].unavailable_models;
-        let at = now();
-        models.retain(|_, until| *until > at);
-        if models.len() >= MODEL_CACHE_LIMIT
-            && !models.contains_key(model)
-            && let Some(oldest) = models
-                .iter()
-                .min_by_key(|(_, until)| *until)
-                .map(|(name, _)| name.clone())
-        {
-            models.remove(&oldest);
-        }
-        models.insert(model.to_owned(), at + MODEL_RETRY_SECONDS);
+        remember_model(
+            &mut state.accounts[idx].unavailable_models,
+            model,
+            now() + MODEL_RETRY_SECONDS,
+        );
     }
 
     /// Ignore quota and account holds: distinguish model access from capacity.
@@ -864,25 +925,18 @@ impl Pool {
     /// A probe fetched a working token. Clear a hold that a failed credential
     /// fetch placed, so the account returns to selection before the hold ends.
     pub fn credentials_verified(&self, idx: usize) {
-        let mut state = self.state.lock().unwrap();
-        let account = &mut state.accounts[idx];
-        if account
-            .last_error
-            .as_deref()
-            .is_some_and(credential_failure)
-        {
-            account.hold_until = 0;
-            account.last_error = None;
-        }
+        clear_credential_hold(&mut self.state.lock().unwrap().accounts[idx]);
     }
 
-    pub fn hold_until(&self, idx: usize) -> Option<u64> {
+    /// End of the hold that blocks `model` on the account. An empty model
+    /// reads only the account hold.
+    pub fn hold_until(&self, idx: usize, model: &str) -> Option<u64> {
         let state = self.state.lock().unwrap();
         state
             .accounts
             .get(idx)
-            .map(|a| a.hold_until)
-            .filter(|until| *until > now())
+            .and_then(|a| blocking_hold(a, model, now()))
+            .map(|(until, _)| until)
     }
 
     /// Hold without an error increment. The caller records the request outcome.
@@ -891,6 +945,37 @@ impl Pool {
         let account = &mut state.accounts[idx];
         account.hold_until = account.hold_until.max(until);
         account.last_error = Some(reason.to_owned());
+    }
+
+    /// Hold one model on the account after an overload, without an error
+    /// increment. The upstream reports capacity per model, so other models on
+    /// the account stay available. A request without a model holds the account.
+    pub fn defer_model(&self, idx: usize, model: &str, until: u64) {
+        if model.is_empty() || model.len() > 256 {
+            return self.defer(idx, until, OVERLOADED);
+        }
+        let mut state = self.state.lock().unwrap();
+        let holds = &mut state.accounts[idx].model_holds;
+        let until = holds.get(model).map_or(until, |held| until.max(*held));
+        remember_model(holds, model, until);
+    }
+
+    /// Record a background credential check of a managed account. A failed
+    /// check marks the account. A working token after a failed check clears
+    /// the mark and the credential hold, so a renewed login serves at once.
+    /// `login` is `Some` when the check shows whether the stored login works.
+    /// Returns the new `login_required` value when it changed.
+    pub fn credential_checked(&self, idx: usize, ok: bool, login: Option<bool>) -> Option<bool> {
+        let mut state = self.state.lock().unwrap();
+        let account = state.accounts.get_mut(idx)?;
+        if !ok {
+            account.last_error = Some(LOGIN_FAILED.to_owned());
+        } else if account.login_required || account.last_error.as_deref() == Some(LOGIN_FAILED) {
+            clear_credential_hold(account);
+        }
+        let login = login.filter(|required| *required != account.login_required)?;
+        account.login_required = login;
+        Some(login)
     }
 
     pub fn record(&self, idx: usize, status: u16, outcome: &str, response: Option<&Value>) {
@@ -996,6 +1081,7 @@ impl Pool {
             })
             .flat_map(|(_, a)| {
                 std::iter::once(a.hold_until)
+                    .chain(a.model_holds.get(model).copied())
                     .chain(a.unavailable_models.get(model).copied())
                     .chain(
                         self.blocking_quotas(a, model, Self::request_limit(a, group), timestamp)
@@ -1025,15 +1111,10 @@ impl Pool {
             .filter(|(idx, a)| {
                 let config = &entries[*idx].account;
                 self.held_with_quota(config, *idx, a, model, group, pinned, timestamp)
-                    || (a.hold_until > timestamp
-                        && self.on_credits(config, *idx, a, model, group, pinned, timestamp))
+                    || self.on_credits(config, *idx, a, model, group, pinned, timestamp)
             })
-            .map(|(_, a)| {
-                (
-                    a.hold_until,
-                    a.last_error.clone().unwrap_or_else(|| "hold".to_owned()),
-                )
-            })
+            .filter_map(|(_, a)| blocking_hold(a, model, timestamp))
+            .map(|(until, reason)| (until, reason.to_owned()))
             .min_by_key(|(until, _)| *until)
     }
 

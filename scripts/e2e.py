@@ -254,6 +254,10 @@ def main():
             if args.model_unavailable:
                 assert status["accounts"][0]["unavailable_models"][observed[0]["body"]["model"]] > time.time()
                 assert status["accounts"][0]["hold_until"] == 0
+            elif args.stream_overload and not args.overload_after_tool:
+                # Capacity is per model: hold the model, not the account.
+                assert status["accounts"][0]["model_holds"][observed[0]["body"]["model"]] > time.time()
+                assert status["accounts"][0]["hold_until"] == 0
             else:
                 assert status["accounts"][0]["hold_until"] > time.time()
             assert status["accounts"][1]["input_tokens"] >= 20

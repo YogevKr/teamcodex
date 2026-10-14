@@ -304,7 +304,8 @@ pub fn error_code(event: &Value) -> Option<String> {
 
 /// Hold for an overload rejection: `server_is_overloaded` or `slow_down`.
 /// Codex reports both as "Selected model is at capacity". They describe
-/// upstream capacity, not this account's quota, so the hold is short.
+/// upstream capacity for one model, not this account's quota, so the hold
+/// is short and covers only that model.
 pub fn overload_hold(event: &Value, timestamp: u64) -> Option<u64> {
     let error = error_object(event);
     if !matches!(
