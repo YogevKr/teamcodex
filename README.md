@@ -298,7 +298,10 @@ TeamCodex uses these rules:
 - Quota exhaustion returns HTTP 429 with `usage_limit_reached`.
 - The response includes a reset time when the proxy knows one.
 - A timeout after connection does not replay the request because its outcome is unknown.
-- Stream errors are never replayed after streaming starts.
+- The proxy holds events without output at the start of a stream until the first output event: `response.created`, `response.in_progress`, `response.queued`, `response.metadata`, `codex.response.metadata`, and `codex.rate_limits`.
+- An overload before the first output event replays the request on another account that the pool can select. Codex receives no bytes from the overloaded attempt.
+- Without such an account, the overload goes to Codex as a retryable error with the hold delay.
+- Stream errors are never replayed after output reaches Codex.
 
 ChatGPT accounts poll `/backend-api/wham/usage` by default.
 API accounts use quota headers from the upstream response.

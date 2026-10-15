@@ -951,6 +951,7 @@ async fn sends_first_stream_chunk_before_upstream_finishes() {
     let mock = mock(|_, _, _| {
         let stream = async_stream::stream! {
             yield Ok::<_, std::io::Error>(Bytes::from_static(b"data: {\"type\":\"response.created\"}\n\n"));
+            yield Ok(Bytes::from_static(b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\n"));
             tokio::time::sleep(Duration::from_millis(600)).await;
             yield Ok(Bytes::from_static(b"data: {\"type\":\"response.completed\",\"response\":{}}\n\n"));
         };
@@ -962,18 +963,24 @@ async fn sends_first_stream_chunk_before_upstream_finishes() {
     });
     let source = upstream(&mock).await;
     let (_, server) = gateway(config(&source.url)).await;
+    let started = Instant::now();
     let response = post(&server)
         .json(&json!({"model":"test","stream":true}))
         .send()
         .await
         .unwrap();
     let mut stream = response.bytes_stream();
-    let first = tokio::time::timeout(Duration::from_millis(250), stream.next())
-        .await
-        .unwrap()
-        .unwrap()
-        .unwrap();
-    assert!(String::from_utf8_lossy(&first).contains("response.created"));
+    let mut received = Vec::new();
+    while !String::from_utf8_lossy(&received).contains("output_text.delta") {
+        received.extend_from_slice(&stream.next().await.unwrap().unwrap());
+    }
+    assert!(
+        started.elapsed() < Duration::from_millis(400),
+        "The first output reaches the client before the upstream finishes"
+    );
+    assert!(
+        String::from_utf8_lossy(&received).starts_with("data: {\"type\":\"response.created\"}")
+    );
     assert!(stream.next().await.unwrap().is_ok());
 }
 
@@ -1341,6 +1348,8 @@ async fn stream_without_content_type_is_forwarded_and_observed() {
     });
     let source = upstream(&mock).await;
     let (pool, server) = gateway(config(&source.url)).await;
+    // Without another account, the proxy forwards the overload as a retryable error.
+    pool.set_enabled("b", false);
     let response = post(&server)
         .header("session_id", "untyped-stream-session")
         .json(&json!({"model":"test","stream":true}))
@@ -1359,6 +1368,7 @@ async fn stream_without_content_type_is_forwarded_and_observed() {
     let snapshot = pool.snapshot();
     assert_eq!(snapshot.recent[0].outcome, "stream_overloaded");
     assert!(snapshot.accounts[0].model_holds["test"] > now());
+    pool.set_enabled("b", true);
     let response = post(&server)
         .header("session_id", "untyped-stream-session")
         .json(&json!({"model":"test","stream":true}))
@@ -1379,13 +1389,22 @@ async fn stream_without_content_type_is_forwarded_and_observed() {
     assert_eq!(snapshot.accounts[1].input_tokens, 11);
 }
 
+/// Upstream overload after the events that carry no output.
+fn overload_before_output(id: &str, code: &str) -> String {
+    let error = json!({"code":code,"message":"The server is overloaded."});
+    format!(
+        "data: {}\n\n: keepalive\n\ndata: {}\n\ndata: {}\n\ndata: {}\n\ndata: {}\n\n",
+        json!({"type":"response.created","response":{"id":id}}),
+        json!({"type":"response.metadata","headers":{"x-codex-turn-state":id}}),
+        json!({"type":"response.in_progress","response":{"id":id}}),
+        json!({"type":"error","error":error}),
+        json!({"type":"response.failed","response":{"id":id,"error":error}}),
+    )
+}
+
 #[tokio::test]
-async fn stream_overload_holds_the_model_so_session_retry_rotates() {
-    let failed = format!(
-        "data: {}\n\n",
-        json!({"type":"response.failed","response":{"error":{
-        "code":"server_is_overloaded","message":"The server is overloaded."}}})
-    );
+async fn stream_overload_before_output_replays_on_another_account() {
+    let failed = overload_before_output("resp_overloaded", "server_is_overloaded");
     let mock = mock(move |token, _, _| {
         if token.ends_with("-a") {
             ([("content-type", "text/event-stream")], failed.clone()).into_response()
@@ -1397,20 +1416,26 @@ async fn stream_overload_holds_the_model_so_session_retry_rotates() {
     let (pool, server) = gateway(config(&source.url)).await;
     let response = post(&server)
         .header("session_id", "overloaded-session")
-        .json(&json!({"model":"test","stream":true}))
+        .json(&json!({"model":"test","stream":true,"input":"same request"}))
         .send()
         .await
         .unwrap();
     assert_eq!(response.status(), 200);
     let body = response.text().await.unwrap();
-    assert!(body.contains("rate_limit_exceeded"));
-    assert!(!body.contains("server_is_overloaded"));
-    assert!(body.contains("Please try again in "));
+    let expected = sse_response().into_body();
+    let expected = to_bytes(expected, 1024 * 1024).await.unwrap();
     assert_eq!(
-        mock.calls.lock().unwrap().len(),
-        1,
-        "The failed stream must not be replayed"
+        body.as_bytes(),
+        expected,
+        "The client receives only the replayed stream, unchanged"
     );
+    {
+        let calls = mock.calls.lock().unwrap();
+        assert_eq!(calls.len(), 2, "The overloaded request is replayed once");
+        assert_eq!(calls[0].0["authorization"], "Bearer test-upstream-a");
+        assert_eq!(calls[1].0["authorization"], "Bearer test-upstream-b");
+        assert_eq!(calls[0].1, calls[1].1, "The replay sends the same body");
+    }
     let snapshot = pool.snapshot();
     let hold = teamcodex::quota::OVERLOAD_HOLD_SECONDS;
     let until = snapshot.accounts[0].model_holds["test"];
@@ -1423,6 +1448,10 @@ async fn stream_overload_holds_the_model_so_session_retry_rotates() {
         Some("stream_overloaded")
     );
     assert_eq!(snapshot.recent[0].outcome, "stream_overloaded");
+    assert_eq!(snapshot.recent[1].outcome, "complete");
+    assert_eq!(snapshot.accounts[1].input_tokens, 11);
+    assert!(snapshot.accounts.iter().all(|a| a.in_flight == 0));
+    // The session continues on the account that served it.
     post(&server)
         .header("session_id", "overloaded-session")
         .json(&json!({"model":"test","stream":true}))
@@ -1433,8 +1462,193 @@ async fn stream_overload_holds_the_model_so_session_retry_rotates() {
         .await
         .unwrap();
     let calls = mock.calls.lock().unwrap();
-    assert_eq!(calls.len(), 2);
-    assert_eq!(calls[1].0["authorization"], "Bearer test-upstream-b");
+    assert_eq!(calls.len(), 3);
+    assert_eq!(calls[2].0["authorization"], "Bearer test-upstream-b");
+}
+
+#[tokio::test]
+async fn stream_overload_before_output_without_another_account_is_forwarded() {
+    for case in ["every account overloaded", "pinned"] {
+        let failed = overload_before_output("resp_overloaded", "slow_down");
+        let mock = mock(move |_, _, _| {
+            ([("content-type", "text/event-stream")], failed.clone()).into_response()
+        });
+        let source = upstream(&mock).await;
+        let (pool, server) = gateway(config(&source.url)).await;
+        let mut body = json!({"model":"test","stream":true});
+        if case == "pinned" {
+            pool.record(0, 200, "complete", Some(&completed("resp_pinned")));
+            body["previous_response_id"] = json!("resp_pinned");
+        }
+        let response = post(&server).json(&body).send().await.unwrap();
+        assert_eq!(response.status(), 200, "{case}");
+        let text = response.text().await.unwrap();
+        let frames = teamcodex::sse::Parser::default().feed(text.as_bytes());
+        let events: Vec<_> = frames.iter().filter_map(|f| f.event.as_ref()).collect();
+        assert_eq!(events.len(), 4, "{case}: held events, then one error");
+        assert_eq!(events[0]["type"], "response.created", "{case}");
+        assert_eq!(events[1]["type"], "response.metadata", "{case}");
+        assert_eq!(events[2]["type"], "response.in_progress", "{case}");
+        assert_eq!(
+            events[3]["response"]["error"]["code"], "rate_limit_exceeded",
+            "{case}"
+        );
+        let until = teamcodex::quota::stream_hold(events[3], now()).unwrap();
+        assert!(
+            until >= now() + teamcodex::quota::OVERLOAD_HOLD_SECONDS - 2,
+            "{case}: wait for the hold when no account can take the request"
+        );
+        let expected = if case == "pinned" { 1 } else { 2 };
+        assert_eq!(mock.calls.lock().unwrap().len(), expected, "{case}");
+        let snapshot = pool.snapshot();
+        for account in &snapshot.accounts[..expected] {
+            assert_eq!(account.last_error.as_deref(), Some("stream_overloaded"));
+            assert!(account.model_holds["test"] > now(), "{case}");
+            assert_eq!(account.in_flight, 0, "{case}");
+        }
+        let outcomes: Vec<_> = snapshot.recent.iter().map(|r| r.outcome.as_str()).collect();
+        let overloads = outcomes
+            .iter()
+            .filter(|o| **o == "stream_overloaded")
+            .count();
+        assert_eq!(overloads, expected, "{case}: one record per attempt");
+    }
+}
+
+#[tokio::test]
+async fn stream_overload_before_output_follows_the_credit_rule() {
+    for case in ["overloaded on credits", "overloaded with plan quota"] {
+        let failed = overload_before_output("resp_overloaded", "server_is_overloaded");
+        let mock = mock(move |token, _, _| {
+            if token.ends_with("-a") {
+                ([("content-type", "text/event-stream")], failed.clone()).into_response()
+            } else {
+                sse_response()
+            }
+        });
+        let source = upstream(&mock).await;
+        let mut cfg = config(&source.url);
+        cfg.accounts[0].spend_credits = true;
+        let pool = credit_pool(&mut cfg);
+        let server = serve(proxy::router(pool.clone(), CLIENT_TOKEN.into())).await;
+        pool.set_credits(0, balance(50.0));
+        pool.set_credits(1, balance(50.0));
+        limit(&pool, 1, 100.0);
+        if case == "overloaded on credits" {
+            limit(&pool, 0, 100.0);
+        }
+        let text = post(&server)
+            .json(&json!({"model":"test","stream":true}))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        let calls = mock.calls.lock().unwrap().len();
+        if case == "overloaded on credits" {
+            assert!(text.contains("resp_test"), "{case}: {text}");
+            assert_eq!(calls, 2, "{case}: another credit account takes it");
+        } else {
+            // An account with plan quota recovers by itself, so no credits are spent.
+            assert!(text.contains("rate_limit_exceeded"), "{case}: {text}");
+            assert_eq!(calls, 1, "{case}: the pool waits");
+            assert_eq!(pool.snapshot().accounts[1].credit_requests, 0);
+        }
+    }
+}
+
+#[tokio::test]
+async fn client_disconnect_before_output_is_recorded() {
+    let mock = mock(|_, _, _| {
+        let stream = async_stream::stream! {
+            yield Ok::<_, std::io::Error>(Bytes::from_static(b"data: {\"type\":\"response.created\"}\n\n"));
+            std::future::pending::<()>().await;
+        };
+        (
+            [("content-type", "text/event-stream")],
+            Body::from_stream(stream),
+        )
+            .into_response()
+    });
+    let source = upstream(&mock).await;
+    let mut cfg = config(&source.url);
+    cfg.idle_timeout_seconds = 30;
+    let (pool, server) = gateway(cfg).await;
+    let sent = post(&server)
+        .json(&json!({"model":"test","stream":true}))
+        .timeout(Duration::from_millis(300))
+        .send()
+        .await;
+    assert!(sent.is_err(), "The proxy holds the response until output");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while pool.snapshot().recent.is_empty() && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let snapshot = pool.snapshot();
+    assert_eq!(snapshot.recent[0].outcome, "client_disconnected");
+    assert_eq!(snapshot.accounts[0].in_flight, 0);
+}
+
+#[tokio::test]
+async fn stream_failure_before_output_is_not_replayed() {
+    let failed = format!(
+        "data: {}\n\ndata: {}\n\n",
+        json!({"type":"response.created"}),
+        json!({"type":"response.failed","response":{"error":{
+            "code":"server_error","message":"An error occurred."}}})
+    );
+    let mock = mock(move |_, _, _| {
+        ([("content-type", "text/event-stream")], failed.clone()).into_response()
+    });
+    let source = upstream(&mock).await;
+    let (pool, server) = gateway(config(&source.url)).await;
+    let text = post(&server)
+        .json(&json!({"model":"test","stream":true}))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(text.contains("server_error"));
+    assert_eq!(mock.calls.lock().unwrap().len(), 1, "Only overloads replay");
+    assert_eq!(pool.snapshot().recent[0].outcome, "stream_failed");
+}
+
+#[tokio::test]
+async fn stalled_stream_before_output_reports_transport_failure() {
+    let mock = mock(|_, _, _| {
+        let stream = async_stream::stream! {
+            yield Ok::<_, std::io::Error>(Bytes::from_static(b"data: {\"type\":\"response.created\"}\n\n"));
+            std::future::pending::<()>().await;
+        };
+        (
+            [("content-type", "text/event-stream")],
+            Body::from_stream(stream),
+        )
+            .into_response()
+    });
+    let source = upstream(&mock).await;
+    let mut cfg = config(&source.url);
+    cfg.idle_timeout_seconds = 1;
+    let (pool, server) = gateway(cfg).await;
+    // The held bytes and the failure leave together. The client can see the
+    // failure before or after the response headers.
+    let result = async {
+        post(&server)
+            .json(&json!({"model":"test","stream":true}))
+            .timeout(Duration::from_secs(5))
+            .send()
+            .await?
+            .bytes()
+            .await
+    }
+    .await;
+    assert!(result.is_err(), "The client sees a transport failure");
+    assert_eq!(mock.calls.lock().unwrap().len(), 1);
+    assert_eq!(pool.snapshot().recent[0].outcome, "stream_transport_failed");
+    assert_eq!(pool.snapshot().accounts[0].in_flight, 0);
 }
 
 #[tokio::test]

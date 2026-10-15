@@ -624,15 +624,53 @@ async fn handle(State(app): State<App>, request: Request) -> Response {
             );
             return buffered_response(status, headers, body);
         }
-        let observation = Observation {
+        let mut observation = Observation {
             lease,
-            status: upstream.status().as_u16(),
+            status: status.as_u16(),
             recorded: false,
             model: model.to_owned(),
             group: group.map(str::to_owned),
             pinned,
         };
-        return forward(upstream, observation, stream_requested).await;
+        // The upstream can answer a streaming request without a content-type
+        // header. The client asked for a stream, so a successful answer is one:
+        // forward it as it arrives and observe its events. Buffering it would hide
+        // in-stream errors and delay every token until the turn ends.
+        let headers = upstream.headers().clone();
+        if !(is_event_stream(&headers) || (stream_requested && status.is_success())) {
+            return forward(upstream, observation).await;
+        }
+        let mut source: Source = upstream
+            .bytes_stream()
+            .map(|chunk| chunk.map_err(std::io::Error::other))
+            .boxed();
+        let mut held = Vec::new();
+        if status.is_success() {
+            let opening = open(&app.pool, idx, model, &mut source).await;
+            if let Some((until, code)) = opening.overload {
+                // Hold first: an account with quota on a hold stops credit use.
+                app.pool.defer_model(idx, model, until);
+                if app.pool.has_candidate(model, group, pinned, &tried) {
+                    // No byte of this stream reached Codex. Another account takes
+                    // the request now, so the overload uses no Codex stream retry.
+                    let mut record = failure_record(
+                        &app.pool,
+                        idx,
+                        status.as_u16(),
+                        "stream_overloaded",
+                        code,
+                        model,
+                    );
+                    record["replayed"] = json!(true);
+                    eprintln!("{record}");
+                    observation.finish("stream_overloaded", None);
+                    continue;
+                }
+            }
+            held = opening.chunks;
+        }
+        let source = futures_util::stream::iter(held).chain(source).boxed();
+        return relay(status, &headers, source, observation);
     }
     if !app.pool.routing_healthy() {
         return routing_error();
@@ -900,12 +938,111 @@ fn log_failure(
 ) {
     eprintln!(
         "{}",
-        json!({
-            "at": now(), "account": pool.account(idx).map(|a| a.name),
-            "status": status, "outcome": outcome, "code": code,
-            "model": model, "hold_until": pool.hold_until(idx, model),
-        })
+        failure_record(pool, idx, status, outcome, code, model)
     );
+}
+
+fn failure_record(
+    pool: &Pool,
+    idx: usize,
+    status: u16,
+    outcome: &str,
+    code: Option<String>,
+    model: &str,
+) -> Value {
+    json!({
+        "at": now(), "account": pool.account(idx).map(|a| a.name),
+        "status": status, "outcome": outcome, "code": code,
+        "model": model, "hold_until": pool.hold_until(idx, model),
+    })
+}
+
+/// Upstream body bytes. A read failure ends the stream.
+type Source = futures_util::stream::BoxStream<'static, std::io::Result<Bytes>>;
+
+/// Events that carry no output. The proxy holds them at the start of a stream.
+/// Codex reads them in order, so a later delivery before the output is safe.
+const OPENING_EVENTS: [&str; 6] = [
+    "response.created",
+    "response.in_progress",
+    "response.queued",
+    "response.metadata",
+    "codex.response.metadata",
+    "codex.rate_limits",
+];
+
+/// Held bytes at the start of a stream. Past this size the proxy forwards them.
+const MAX_OPENING: usize = 4 * 1024 * 1024;
+
+struct Opening {
+    /// Bytes read so far, in order. A read failure or timeout is the last item.
+    chunks: Vec<std::io::Result<Bytes>>,
+    /// Hold end and error code of an overload that arrived before any output.
+    overload: Option<(u64, Option<String>)>,
+}
+
+/// Read a successful stream until its first event that is not in
+/// `OPENING_EVENTS`. The caller holds these bytes. An overload in this part
+/// reached no client, so the request can move to another account.
+async fn open(pool: &Pool, idx: usize, model: &str, source: &mut Source) -> Opening {
+    let idle = pool.config.idle_timeout_seconds;
+    let mut parser = Parser::default();
+    let mut chunks = Vec::new();
+    let mut size = 0;
+    loop {
+        let bytes = match tokio::time::timeout(Duration::from_secs(idle), source.next()).await {
+            Ok(Some(Ok(bytes))) => bytes,
+            Ok(Some(Err(failure))) => {
+                chunks.push(Err(failure));
+                break;
+            }
+            Ok(None) => break,
+            Err(_) => {
+                chunks.push(Err(std::io::ErrorKind::TimedOut.into()));
+                break;
+            }
+        };
+        size += bytes.len();
+        let frames = parser.feed(&bytes);
+        chunks.push(Ok(bytes));
+        for event in frames.iter().filter_map(|frame| frame.event.as_ref()) {
+            observe_quotas(pool, idx, event);
+            match event.get("type").and_then(Value::as_str) {
+                Some(kind) if OPENING_EVENTS.contains(&kind) => {}
+                // Classify as `Observation::event` does: an overload is not a
+                // model access or rate-limit failure.
+                Some("response.failed" | "response.incomplete" | "error") => {
+                    let overload = (!models::unavailable(event, model)
+                        && quota::stream_hold(event, now()).is_none())
+                    .then(|| quota::overload_hold(event, now()))
+                    .flatten()
+                    .map(|until| (until, quota::error_code(event)));
+                    return Opening { chunks, overload };
+                }
+                _ => {
+                    return Opening {
+                        chunks,
+                        overload: None,
+                    };
+                }
+            }
+        }
+        if parser.overflowed || size >= MAX_OPENING {
+            break;
+        }
+    }
+    Opening {
+        chunks,
+        overload: None,
+    }
+}
+
+/// Record the quota windows and credits that a stream event reports.
+fn observe_quotas(pool: &Pool, idx: usize, event: &Value) {
+    pool.update_quotas(idx, quota::usage(event, now()));
+    if event.get("type").and_then(Value::as_str) == Some("codex.rate_limits") {
+        pool.set_credits(idx, quota::credits(event));
+    }
 }
 
 struct Observation {
@@ -918,14 +1055,7 @@ struct Observation {
 }
 impl Observation {
     fn event(&mut self, event: &Value) -> Option<u64> {
-        self.lease
-            .pool
-            .update_quotas(self.lease.idx, quota::usage(event, now()));
-        if event.get("type").and_then(Value::as_str) == Some("codex.rate_limits") {
-            self.lease
-                .pool
-                .set_credits(self.lease.idx, quota::credits(event));
-        }
+        observe_quotas(&self.lease.pool, self.lease.idx, event);
         match event.get("type").and_then(Value::as_str) {
             Some("response.completed") => self.finish("complete", event.get("response")),
             Some("response.failed" | "response.incomplete" | "error") => {
@@ -996,92 +1126,92 @@ impl Drop for Observation {
     }
 }
 
-async fn forward(
-    upstream: reqwest::Response,
+/// Forward an event stream as it arrives and observe its events. The source
+/// can start with bytes that `open` held.
+fn relay(
+    status: StatusCode,
+    upstream_headers: &HeaderMap,
+    mut source: Source,
     mut observation: Observation,
-    stream_requested: bool,
 ) -> Response {
     let idle = observation.lease.pool.config.idle_timeout_seconds;
-    let status = upstream.status();
-    let mut headers = response_headers(upstream.headers());
-    // The upstream can answer a streaming request without a content-type
-    // header. The client asked for a stream, so a successful answer is one:
-    // forward it as it arrives and observe its events. Buffering it would hide
-    // in-stream errors and delay every token until the turn ends.
-    let stream = is_event_stream(upstream.headers()) || (stream_requested && status.is_success());
-    if stream && !headers.contains_key("content-type") {
+    let mut headers = response_headers(upstream_headers);
+    if !headers.contains_key("content-type") {
         headers.insert(
             "content-type",
             HeaderValue::from_static("text/event-stream"),
         );
     }
-    if stream {
-        let mut source = upstream.bytes_stream();
-        let output = async_stream::stream! {
-            let mut parser = Parser::default();
-            loop {
-                match tokio::time::timeout(Duration::from_secs(idle), source.next()).await {
-                    Ok(Some(Ok(bytes))) => {
-                        for frame in parser.feed(&bytes) {
-                            if let Some(until) = frame.event.as_ref().and_then(|event| observation.event(event)) {
-                                // Codex treats server_is_overloaded as terminal. A rate-limit
-                                // event keeps its bounded retry loop and honors the hold delay.
-                                let seconds = until.saturating_sub(now()).max(1);
-                                let event = json!({"type":"response.failed","response":{"error":{
-                                    "code":"rate_limit_exceeded",
-                                    "message":format!("Model capacity is temporarily unavailable. Please try again in {seconds}s.")
-                                }}});
-                                yield Ok::<Bytes, std::io::Error>(Bytes::from(format!("event: response.failed\ndata: {event}\n\n")));
-                                return;
-                            }
-                            yield Ok::<Bytes, std::io::Error>(Bytes::from(frame.bytes));
+    let output = async_stream::stream! {
+        let mut parser = Parser::default();
+        loop {
+            match tokio::time::timeout(Duration::from_secs(idle), source.next()).await {
+                Ok(Some(Ok(bytes))) => {
+                    for frame in parser.feed(&bytes) {
+                        if let Some(until) = frame.event.as_ref().and_then(|event| observation.event(event)) {
+                            // Codex treats server_is_overloaded as terminal. A rate-limit
+                            // event keeps its bounded retry loop and honors the hold delay.
+                            let seconds = until.saturating_sub(now()).max(1);
+                            let event = json!({"type":"response.failed","response":{"error":{
+                                "code":"rate_limit_exceeded",
+                                "message":format!("Model capacity is temporarily unavailable. Please try again in {seconds}s.")
+                            }}});
+                            yield Ok::<Bytes, std::io::Error>(Bytes::from(format!("event: response.failed\ndata: {event}\n\n")));
+                            return;
                         }
-                    }
-                    Ok(None) => {
-                        let remaining = parser.finish();
-                        if !remaining.is_empty() {
-                            yield Ok(Bytes::from(remaining));
-                        }
-                        if !observation.recorded {
-                            observation.finish(if parser.overflowed { "observation_overflow" } else { "stream_truncated" }, None);
-                        }
-                        break;
-                    }
-                    _ => {
-                        observation.finish("stream_transport_failed", None);
-                        yield Err(std::io::Error::other("upstream stream interrupted"));
-                        break;
+                        yield Ok::<Bytes, std::io::Error>(Bytes::from(frame.bytes));
                     }
                 }
+                Ok(None) => {
+                    let remaining = parser.finish();
+                    if !remaining.is_empty() {
+                        yield Ok(Bytes::from(remaining));
+                    }
+                    if !observation.recorded {
+                        observation.finish(if parser.overflowed { "observation_overflow" } else { "stream_truncated" }, None);
+                    }
+                    break;
+                }
+                _ => {
+                    observation.finish("stream_transport_failed", None);
+                    yield Err(std::io::Error::other("upstream stream interrupted"));
+                    break;
+                }
             }
-        };
-        let mut response = Response::new(Body::from_stream(output));
-        *response.status_mut() = status;
-        *response.headers_mut() = headers;
-        response
-    } else {
-        let bytes = match read_bounded(upstream, MAX_RESPONSE_BODY, idle).await {
-            Ok(bytes) => bytes,
-            Err(_) => {
-                observation.finish("response_read_failed", None);
-                return error(
-                    StatusCode::BAD_GATEWAY,
-                    "response_read_failed",
-                    "Upstream response exceeded limits or ended early",
-                );
-            }
-        };
-        let value = serde_json::from_slice::<Value>(&bytes).ok();
-        observation.finish(
-            if status.is_success() {
-                "complete"
-            } else {
-                "upstream_rejected"
-            },
-            value.as_ref(),
-        );
-        buffered_response(status, headers, bytes)
-    }
+        }
+    };
+    let mut response = Response::new(Body::from_stream(output));
+    *response.status_mut() = status;
+    *response.headers_mut() = headers;
+    response
+}
+
+/// Forward a response that is not an event stream after it ends.
+async fn forward(upstream: reqwest::Response, mut observation: Observation) -> Response {
+    let idle = observation.lease.pool.config.idle_timeout_seconds;
+    let status = upstream.status();
+    let headers = response_headers(upstream.headers());
+    let bytes = match read_bounded(upstream, MAX_RESPONSE_BODY, idle).await {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            observation.finish("response_read_failed", None);
+            return error(
+                StatusCode::BAD_GATEWAY,
+                "response_read_failed",
+                "Upstream response exceeded limits or ended early",
+            );
+        }
+    };
+    let value = serde_json::from_slice::<Value>(&bytes).ok();
+    observation.finish(
+        if status.is_success() {
+            "complete"
+        } else {
+            "upstream_rejected"
+        },
+        value.as_ref(),
+    );
+    buffered_response(status, headers, bytes)
 }
 
 pub async fn read_bounded(

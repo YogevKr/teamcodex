@@ -474,31 +474,8 @@ impl Pool {
         let session =
             session.map(|key| affinity::hash(&serde_json::to_vec(&(model, group, key)).unwrap()));
         let timestamp = now();
-        let collect = |accept: &dyn Fn(&Account, usize, &AccountState) -> bool| -> Vec<usize> {
-            state
-                .accounts
-                .iter()
-                .enumerate()
-                .filter(|(idx, account)| {
-                    !tried.contains(idx) && accept(&entries[*idx].account, *idx, account)
-                })
-                .map(|(idx, _)| idx)
-                .collect()
-        };
-        let mut candidates = collect(&|config, idx, account| {
-            self.eligible(config, idx, account, model, group, pinned, timestamp)
-        });
-        // Plan quota first. Credits cost money, so they serve a request only
-        // when no account has plan quota left. An account with quota that
-        // waits out a transient hold recovers by itself; the pool waits too.
-        let credit = candidates.is_empty()
-            && !self.transient_hold(&entries, &state, model, group, pinned, timestamp);
-        if credit {
-            candidates = collect(&|config, idx, account| {
-                blocking_hold(account, model, timestamp).is_none()
-                    && self.on_credits(config, idx, account, model, group, pinned, timestamp)
-            });
-        }
+        let (candidates, credit) =
+            self.candidates(&entries, &state, model, group, pinned, tried, timestamp);
         // An eligible established session stays on its account, including after
         // a higher-priority account recovers. Priority selects new sessions.
         let affinity = session
@@ -534,6 +511,64 @@ impl Pool {
             pool: self.clone(),
             idx,
         })
+    }
+
+    /// True when `select` can choose an account for this request now.
+    pub fn has_candidate(
+        &self,
+        model: &str,
+        group: Option<&str>,
+        pinned: Option<usize>,
+        tried: &[usize],
+    ) -> bool {
+        let entries = self.accounts.read().unwrap();
+        let state = self.state.lock().unwrap();
+        state.routing.healthy()
+            && !self
+                .candidates(&entries, &state, model, group, pinned, tried, now())
+                .0
+                .is_empty()
+    }
+
+    /// Accounts that `select` chooses from, and whether they serve on credits.
+    #[allow(clippy::too_many_arguments)]
+    fn candidates(
+        &self,
+        entries: &[Entry],
+        state: &State,
+        model: &str,
+        group: Option<&str>,
+        pinned: Option<usize>,
+        tried: &[usize],
+        timestamp: u64,
+    ) -> (Vec<usize>, bool) {
+        let collect = |accept: &dyn Fn(&Account, usize, &AccountState) -> bool| -> Vec<usize> {
+            state
+                .accounts
+                .iter()
+                .enumerate()
+                .filter(|(idx, account)| {
+                    !tried.contains(idx) && accept(&entries[*idx].account, *idx, account)
+                })
+                .map(|(idx, _)| idx)
+                .collect()
+        };
+        let candidates = collect(&|config, idx, account| {
+            self.eligible(config, idx, account, model, group, pinned, timestamp)
+        });
+        // Plan quota first. Credits cost money, so they serve a request only
+        // when no account has plan quota left. An account with quota that
+        // waits out a transient hold recovers by itself; the pool waits too.
+        if !candidates.is_empty()
+            || self.transient_hold(entries, state, model, group, pinned, timestamp)
+        {
+            return (candidates, false);
+        }
+        let candidates = collect(&|config, idx, account| {
+            blocking_hold(account, model, timestamp).is_none()
+                && self.on_credits(config, idx, account, model, group, pinned, timestamp)
+        });
+        (candidates, true)
     }
 
     pub fn update_quotas(&self, idx: usize, quotas: Quotas) {
