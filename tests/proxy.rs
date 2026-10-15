@@ -1393,10 +1393,11 @@ async fn stream_without_content_type_is_forwarded_and_observed() {
 fn overload_before_output(id: &str, code: &str) -> String {
     let error = json!({"code":code,"message":"The server is overloaded."});
     format!(
-        "data: {}\n\n: keepalive\n\ndata: {}\n\ndata: {}\n\ndata: {}\n\ndata: {}\n\n",
+        "data: {}\n\n: keepalive\n\ndata: {}\n\ndata: {}\n\ndata: {}\n\ndata: {}\n\ndata: {}\n\n",
         json!({"type":"response.created","response":{"id":id}}),
         json!({"type":"response.metadata","headers":{"x-codex-turn-state":id}}),
         json!({"type":"response.in_progress","response":{"id":id}}),
+        json!({"type":"keepalive"}),
         json!({"type":"error","error":error}),
         json!({"type":"response.failed","response":{"id":id,"error":error}}),
     )
@@ -1485,15 +1486,16 @@ async fn stream_overload_before_output_without_another_account_is_forwarded() {
         let text = response.text().await.unwrap();
         let frames = teamcodex::sse::Parser::default().feed(text.as_bytes());
         let events: Vec<_> = frames.iter().filter_map(|f| f.event.as_ref()).collect();
-        assert_eq!(events.len(), 4, "{case}: held events, then one error");
+        assert_eq!(events.len(), 5, "{case}: held events, then one error");
         assert_eq!(events[0]["type"], "response.created", "{case}");
         assert_eq!(events[1]["type"], "response.metadata", "{case}");
         assert_eq!(events[2]["type"], "response.in_progress", "{case}");
+        assert_eq!(events[3]["type"], "keepalive", "{case}");
         assert_eq!(
-            events[3]["response"]["error"]["code"], "rate_limit_exceeded",
+            events[4]["response"]["error"]["code"], "rate_limit_exceeded",
             "{case}"
         );
-        let until = teamcodex::quota::stream_hold(events[3], now()).unwrap();
+        let until = teamcodex::quota::stream_hold(events[4], now()).unwrap();
         assert!(
             until >= now() + teamcodex::quota::OVERLOAD_HOLD_SECONDS - 2,
             "{case}: wait for the hold when no account can take the request"

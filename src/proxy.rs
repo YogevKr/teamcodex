@@ -963,13 +963,15 @@ type Source = futures_util::stream::BoxStream<'static, std::io::Result<Bytes>>;
 
 /// Events that carry no output. The proxy holds them at the start of a stream.
 /// Codex reads them in order, so a later delivery before the output is safe.
-const OPENING_EVENTS: [&str; 6] = [
+const OPENING_EVENTS: [&str; 7] = [
     "response.created",
     "response.in_progress",
     "response.queued",
     "response.metadata",
     "codex.response.metadata",
     "codex.rate_limits",
+    // The upstream sends it while a request waits, before an overload too.
+    "keepalive",
 ];
 
 /// Held bytes at the start of a stream. Past this size the proxy forwards them.
