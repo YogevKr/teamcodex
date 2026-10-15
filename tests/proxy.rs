@@ -1575,15 +1575,23 @@ async fn client_disconnect_before_output_is_recorded() {
     let mut cfg = config(&source.url);
     cfg.idle_timeout_seconds = 30;
     let (pool, server) = gateway(cfg).await;
-    let sent = post(&server)
-        .json(&json!({"model":"test","stream":true}))
-        .timeout(Duration::from_millis(300))
-        .send()
-        .await;
-    assert!(sent.is_err(), "The proxy holds the response until output");
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let client = tokio::spawn(
+        post(&server)
+            .json(&json!({"model":"test","stream":true}))
+            .send(),
+    );
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while mock.calls.lock().unwrap().is_empty() && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(mock.calls.lock().unwrap().len(), 1);
+    assert!(
+        !client.is_finished(),
+        "The proxy holds the response until output"
+    );
+    client.abort();
     while pool.snapshot().recent.is_empty() && Instant::now() < deadline {
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
     }
     let snapshot = pool.snapshot();
     assert_eq!(snapshot.recent[0].outcome, "client_disconnected");

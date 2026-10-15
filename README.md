@@ -302,6 +302,8 @@ TeamCodex uses these rules:
 - An overload before the first output event replays the request on another account that the pool can select. Codex receives no bytes from the overloaded attempt.
 - Without such an account, the overload goes to Codex as a retryable error with the hold delay.
 - Stream errors are never replayed after output reaches Codex.
+- The server log marks a replayed overload with `"replayed": true`.
+- A log line for a stream error names `first_output`: the first event outside the held list, or `null` when no output started.
 
 ChatGPT accounts poll `/backend-api/wham/usage` by default.
 API accounts use quota headers from the upstream response.

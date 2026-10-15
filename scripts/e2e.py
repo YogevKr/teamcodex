@@ -270,6 +270,18 @@ def main():
             assert request(url, "/status")["accounts"][1]["disabled"]
             subprocess.run(command + ["account", "b", "enable"], env=env, capture_output=True, check=True)
             assert not request(url, "/status")["accounts"][1]["disabled"]
+            if args.stream_overload:
+                # The overload arrives before any output. With account b free,
+                # the proxy replays it. With b held after the tool, Codex retries.
+                records = [json.loads(line) for line in startup_diagnostics(process).splitlines()
+                    if line.startswith("{")]
+                overloads = [r for r in records if r.get("outcome") == "stream_overloaded"]
+                assert len(overloads) == 1, records
+                if args.overload_after_tool:
+                    assert "replayed" not in overloads[0], overloads
+                    assert overloads[0]["first_output"] is None, overloads
+                else:
+                    assert overloads[0]["replayed"] is True, overloads
             print(json.dumps({"result": "PASS", "codex_tool_cycle": not args.skip_codex,
                 "upstream_requests": len(observed), "failover": True, "status": True,
                 "transient_error_recovered": args.transient_error,

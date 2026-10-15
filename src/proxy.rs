@@ -631,6 +631,7 @@ async fn handle(State(app): State<App>, request: Request) -> Response {
             model: model.to_owned(),
             group: group.map(str::to_owned),
             pinned,
+            first_output: None,
         };
         // The upstream can answer a streaming request without a content-type
         // header. The client asked for a stream, so a successful answer is one:
@@ -1037,6 +1038,13 @@ async fn open(pool: &Pool, idx: usize, model: &str, source: &mut Source) -> Open
     }
 }
 
+/// Keep the type of the first event outside `OPENING_EVENTS`, bounded for logs.
+fn note_output(first: &mut Option<String>, kind: Option<&str>) {
+    if first.is_none() && kind.is_none_or(|kind| !OPENING_EVENTS.contains(&kind)) {
+        *first = Some(kind.unwrap_or("untyped").chars().take(64).collect());
+    }
+}
+
 /// Record the quota windows and credits that a stream event reports.
 fn observe_quotas(pool: &Pool, idx: usize, event: &Value) {
     pool.update_quotas(idx, quota::usage(event, now()));
@@ -1052,6 +1060,9 @@ struct Observation {
     model: String,
     group: Option<String>,
     pinned: Option<usize>,
+    /// Type of the first event outside `OPENING_EVENTS`. A stream failure log
+    /// carries it, so an overload that was not replayed shows why.
+    first_output: Option<String>,
 }
 impl Observation {
     fn event(&mut self, event: &Value) -> Option<u64> {
@@ -1090,7 +1101,7 @@ impl Observation {
                 // The upstream sends an `error` event and then `response.failed`
                 // for one failure. Record and log the first only.
                 if !self.recorded {
-                    log_failure(
+                    let mut record = failure_record(
                         &self.lease.pool,
                         self.lease.idx,
                         self.status,
@@ -1098,11 +1109,13 @@ impl Observation {
                         quota::error_code(event),
                         &self.model,
                     );
+                    record["first_output"] = json!(self.first_output);
+                    eprintln!("{record}");
                 }
                 self.finish(outcome, event.get("response"));
                 return retry_at;
             }
-            _ => {}
+            kind => note_output(&mut self.first_output, kind),
         }
         None
     }
@@ -1346,5 +1359,28 @@ pub async fn reload_loop(pool: Arc<Pool>, interval: Duration) {
                 json!({"at": now(), "event": "config_reload_failed", "reason": error.to_string()})
             ),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn first_output_skips_held_events_and_keeps_the_first() {
+        let mut first = None;
+        for kind in OPENING_EVENTS {
+            note_output(&mut first, Some(kind));
+        }
+        assert_eq!(first, None);
+        note_output(&mut first, Some("response.output_item.added"));
+        note_output(&mut first, Some("response.output_text.delta"));
+        assert_eq!(first.as_deref(), Some("response.output_item.added"));
+        let mut untyped = None;
+        note_output(&mut untyped, None);
+        assert_eq!(untyped.as_deref(), Some("untyped"));
+        let mut long = None;
+        note_output(&mut long, Some(&"x".repeat(100)));
+        assert_eq!(long.map(|kind| kind.len()), Some(64));
     }
 }
